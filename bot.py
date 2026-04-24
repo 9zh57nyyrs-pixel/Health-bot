@@ -170,8 +170,8 @@ except ValueError:
 
 async def log_food_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 await update.message.reply_text(
-“Опишите что вы съели (можно подробно или кратко).\n”
-“Например: ‘Овсянка с бананом и кофе с молоком’ или ‘Куриная грудка 200г, рис 150г, салат’”
+"Опишите что вы съели (можно подробно или кратко).\n"
+"Например: 'Овсянка с бананом и кофе с молоком' или 'Куриная грудка 200г, рис 150г, салат'"
 )
 return LOG_FOOD
 
@@ -190,8 +190,8 @@ return ConversationHandler.END
 
 async def log_activity_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 await update.message.reply_text(
-“Опишите вашу физическую активность.\n”
-“Например: ‘Бег 30 минут’ или ‘Силовая тренировка 1 час, грудь и трицепс’”
+"Опишите вашу физическую активность.\n"
+"Например: 'Бег 30 минут' или 'Силовая тренировка 1 час, грудь и трицепс'"
 )
 return LOG_ACTIVITY
 
@@ -212,7 +212,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 user_id = update.effective_user.id
 user = db.get_user(user_id)
 if not user:
-await update.message.reply_text(“Сначала создайте профиль командой /start”)
+await update.message.reply_text("Сначала создайте профиль командой /start")
 return
 
 ```
@@ -252,7 +252,7 @@ async def show_checkup_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 user_id = update.effective_user.id
 user = db.get_user(user_id)
 if not user:
-await update.message.reply_text(“Сначала создайте профиль командой /start”)
+await update.message.reply_text("Сначала создайте профиль командой /start")
 return
 
 ```
@@ -283,11 +283,11 @@ except Exception as e:
 ```
 
 async def show_health_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-“”“Show AI-generated health score with alerts and positives”””
+"""Show AI-generated health score with alerts and positives"""
 user_id = update.effective_user.id
 user = db.get_user(user_id)
 if not user:
-await update.message.reply_text(“Сначала создайте профиль командой /start”)
+await update.message.reply_text("Сначала создайте профиль командой /start")
 return
 
 ```
@@ -356,7 +356,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 user_id = update.effective_user.id
 user = db.get_user(user_id)
 if not user:
-await update.message.reply_text(“Сначала создайте профиль командой /start”)
+await update.message.reply_text("Сначала создайте профиль командой /start")
 return
 
 ```
@@ -424,7 +424,7 @@ except Exception as e:
 ```
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-“”“Handle regular text messages - chat with AI doctor”””
+"""Handle regular text messages - chat with AI doctor"""
 user_id = update.effective_user.id
 user = db.get_user(user_id)
 text = update.message.text
@@ -579,5 +579,5 @@ logger.info("🏥 Health Bot запущен!")
 app.run_polling(allowed_updates=Update.ALL_TYPES)
 ```
 
-if **name** == ‘**main**’:
+if **name** == '**main**":
 main()
