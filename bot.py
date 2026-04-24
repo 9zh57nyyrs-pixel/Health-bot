@@ -248,7 +248,7 @@ await update.message.reply_text(stats, parse_mode='Markdown', reply_markup=get_m
 ```
 
 async def show_checkup_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-“”“Generate personalized checkup plan based on age, gender, data”””
+"""Generate personalized checkup plan based on age, gender, data"""
 user_id = update.effective_user.id
 user = db.get_user(user_id)
 if not user:
