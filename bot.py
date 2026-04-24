@@ -26,11 +26,11 @@ LOG_WEIGHT, LOG_FOOD, LOG_ACTIVITY = range(5, 8)
 
 def get_main_keyboard():
 keyboard = [
-[KeyboardButton(“💬 Чат с врачом”), KeyboardButton(“📊 Моя статистика”)],
-[KeyboardButton(“⚖️ Записать вес”), KeyboardButton(“🍎 Записать питание”)],
-[KeyboardButton(“🏃 Записать активность”), KeyboardButton(“🔬 Загрузить анализы”)],
-[KeyboardButton(“🧪 План обследований”), KeyboardButton(“❤️ Оценка здоровья”)],
-[KeyboardButton(“👤 Мой профиль”)]
+[KeyboardButton("💬 Чат с врачом"), KeyboardButton("📊 Моя статистика")],
+[KeyboardButton("⚖️ Записать вес"), KeyboardButton("🍎 Записать питание")],
+[KeyboardButton("🏃 Записать активность"), KeyboardButton("🔬 Загрузить анализы")],
+[KeyboardButton("🧪 План обследований"), KeyboardButton("❤️ Оценка здоровья")],
+[KeyboardButton("👤 Мой профиль")]
 ]
 return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
