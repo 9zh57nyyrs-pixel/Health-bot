@@ -579,5 +579,5 @@ logger.info("🏥 Health Bot запущен!")
 app.run_polling(allowed_updates=Update.ALL_TYPES)
 ```
 
-if **name** == '**main**":
+if **name** == '**main**':
 main()
