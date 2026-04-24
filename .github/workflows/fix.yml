@@ -1,572 +1,499 @@
-name: Fix Smart Quotes and Rewrite Bot Files
+name: Fix Bot Files
 
 on:
   push:
     branches: [ main, master ]
 
 jobs:
-  fix-and-rewrite:
+  rewrite:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Rewrite all bot files with clean code
+      - name: Rewrite files via Python
         run: |
-          # config.py
-          cat > config.py << 'ENDOFFILE'
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-DATABASE_PATH = "health_bot.db"
-CLAUDE_MODEL = "claude-opus-4-5"
-MAX_TOKENS = 2048
-ENDOFFILE
-
-          # database.py
-          cat > database.py << 'ENDOFFILE'
-import sqlite3
-from config import DATABASE_PATH
-
-
-def get_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            age INTEGER,
-            gender TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS health_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            record_type TEXT,
-            value TEXT,
-            notes TEXT,
-            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            role TEXT,
-            content TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def save_user(user_id, username, first_name):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT OR IGNORE INTO users (user_id, username, first_name)
-        VALUES (?, ?, ?)
-    """, (user_id, username, first_name))
-    conn.commit()
-    conn.close()
-
-
-def save_health_record(user_id, record_type, value, notes=""):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO health_records (user_id, record_type, value, notes)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, record_type, value, notes))
-    conn.commit()
-    conn.close()
-
-
-def get_health_records(user_id, record_type=None, limit=10):
-    conn = get_connection()
-    cursor = conn.cursor()
-    if record_type:
-        cursor.execute("""
-            SELECT * FROM health_records
-            WHERE user_id = ? AND record_type = ?
-            ORDER BY recorded_at DESC LIMIT ?
-        """, (user_id, record_type, limit))
-    else:
-        cursor.execute("""
-            SELECT * FROM health_records
-            WHERE user_id = ?
-            ORDER BY recorded_at DESC LIMIT ?
-        """, (user_id, limit))
-    records = cursor.fetchall()
-    conn.close()
-    return records
-
-
-def save_conversation(user_id, role, content):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO conversations (user_id, role, content)
-        VALUES (?, ?, ?)
-    """, (user_id, role, content))
-    conn.commit()
-    conn.close()
-
-
-def get_conversation_history(user_id, limit=20):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT role, content FROM conversations
-        WHERE user_id = ?
-        ORDER BY created_at DESC LIMIT ?
-    """, (user_id, limit))
-    rows = cursor.fetchall()
-    conn.close()
-    return list(reversed(rows))
-
-
-def get_user_info(user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
-
-
-def update_user_info(user_id, age=None, gender=None):
-    conn = get_connection()
-    cursor = conn.cursor()
-    if age is not None:
-        cursor.execute("UPDATE users SET age = ? WHERE user_id = ?", (age, user_id))
-    if gender is not None:
-        cursor.execute("UPDATE users SET gender = ? WHERE user_id = ?", (gender, user_id))
-    conn.commit()
-    conn.close()
-ENDOFFILE
-
-          # claude_client.py
-          cat > claude_client.py << 'ENDOFFILE'
-import anthropic
-import base64
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MAX_TOKENS
-
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-SYSTEM_PROMPT = """You are an AI health assistant and personal doctor. You help users:
-- Track their weight, nutrition, and physical activity
-- Analyze medical test results from photos
-- Create health screening plans based on age and gender
-- Assess overall health on a scale of 1-10
-- Provide general health advice and answer medical questions
-
-Important guidelines:
-- Always remind users that you are an AI and cannot replace a real doctor
-- For serious symptoms, always recommend consulting a healthcare professional
-- Be empathetic, clear, and supportive
-- Respond in the same language the user writes in
-- Keep responses concise but informative"""
-
-
-def chat_with_claude(messages, user_info=None):
-    system = SYSTEM_PROMPT
-    if user_info and (user_info["age"] or user_info["gender"]):
-        age = user_info["age"] or "unknown"
-        gender = user_info["gender"] or "unknown"
-        system += f"\n\nUser profile: Age {age}, Gender: {gender}"
-
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system,
-        messages=messages
-    )
-    return response.content[0].text
-
-
-def analyze_medical_image(image_data, image_type="jpeg", user_message=""):
-    if isinstance(image_data, bytes):
-        image_b64 = base64.standard_b64encode(image_data).decode("utf-8")
-    else:
-        image_b64 = image_data
-
-    prompt = user_message if user_message else "Please analyze this medical document or test result. Explain what the values mean and if anything requires attention."
-
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": f"image/{image_type}",
-                            "data": image_b64
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    )
-    return response.content[0].text
-ENDOFFILE
-
-          # bot.py
-          cat > bot.py << 'ENDOFFILE'
-import logging
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler
-)
-from config import TELEGRAM_TOKEN
-from database import init_db, save_user, save_health_record, get_health_records, save_conversation, get_conversation_history, get_user_info, update_user_info
-from claude_client import chat_with_claude, analyze_medical_image
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-SETTING_AGE, SETTING_GENDER = range(2)
-
-MAIN_KEYBOARD = ReplyKeyboardMarkup([
-    [KeyboardButton("Weight"), KeyboardButton("Nutrition")],
-    [KeyboardButton("Activity"), KeyboardButton("Analysis")],
-    [KeyboardButton("Health Score"), KeyboardButton("Screening Plan")],
-    [KeyboardButton("My Profile"), KeyboardButton("History")]
-], resize_keyboard=True)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    save_user(user.id, user.username, user.first_name)
-    welcome_text = (
-        f"Hello, {user.first_name}! I am your personal AI health assistant.\n\n"
-        "I can help you:\n"
-        "Track weight, nutrition, activity\n"
-        "Analyze medical tests from photos\n"
-        "Create a health screening plan\n"
-        "Assess your health score\n\n"
-        "Use the menu below or just write to me in free form.\n\n"
-        "Remember: I am an AI assistant and cannot replace a real doctor."
-    )
-    await update.message.reply_text(welcome_text, reply_markup=MAIN_KEYBOARD)
-
-
-async def handle_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Please enter your weight in kg (for example: 70.5):"
-    )
-    context.user_data["expecting"] = "weight"
-
-
-async def handle_nutrition(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Describe what you ate today or a specific meal:"
-    )
-    context.user_data["expecting"] = "nutrition"
-
-
-async def handle_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Describe your physical activity (type, duration, intensity):"
-    )
-    context.user_data["expecting"] = "activity"
-
-
-async def handle_health_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    records = get_health_records(user_id, limit=20)
-    history = get_conversation_history(user_id, limit=10)
-    user_info = get_user_info(user_id)
-
-    records_text = ""
-    if records:
-        for r in records[:10]:
-            records_text += f"- {r['record_type']}: {r['value']}\n"
-
-    messages = history[-6:] if len(history) > 6 else history
-    messages = [{"role": m["role"], "content": m["content"]} for m in messages]
-    messages.append({
-        "role": "user",
-        "content": f"Based on the health data below, assess my health on a scale of 1-10 and provide recommendations.\n\nRecent records:\n{records_text if records_text else 'No data yet'}"
-    })
-
-    response = chat_with_claude(messages, user_info)
-    await update.message.reply_text(response, reply_markup=MAIN_KEYBOARD)
-
-
-async def handle_screening_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_info = get_user_info(user_id)
-
-    if not user_info or not user_info["age"] or not user_info["gender"]:
-        await update.message.reply_text(
-            "To create a personal screening plan, I need to know your age and gender.\n"
-            "Please set up your profile using /profile"
-        )
-        return
-
-    messages = [{
-        "role": "user",
-        "content": f"Create a health screening plan for a person: age {user_info['age']}, gender {user_info['gender']}. List which tests, examinations and preventive measures are recommended and at what frequency."
-    }]
-
-    response = chat_with_claude(messages, user_info)
-    save_conversation(user_id, "user", "Screening plan request")
-    save_conversation(user_id, "assistant", response)
-    await update.message.reply_text(response, reply_markup=MAIN_KEYBOARD)
-
-
-async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_info = get_user_info(user_id)
-
-    profile_text = "Your profile:\n"
-    profile_text += f"Name: {user_info['first_name'] if user_info else 'Unknown'}\n"
-    profile_text += f"Age: {user_info['age'] if user_info and user_info['age'] else 'Not set'}\n"
-    profile_text += f"Gender: {user_info['gender'] if user_info and user_info['gender'] else 'Not set'}\n\n"
-    profile_text += "To update, use /setage and /setgender commands"
-
-    await update.message.reply_text(profile_text, reply_markup=MAIN_KEYBOARD)
-
-
-async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    records = get_health_records(user_id, limit=10)
-
-    if not records:
-        await update.message.reply_text("No health records yet.", reply_markup=MAIN_KEYBOARD)
-        return
-
-    history_text = "Your recent health records:\n\n"
-    for r in records:
-        history_text += f"{r['recorded_at'][:10]} - {r['record_type']}: {r['value']}\n"
-        if r["notes"]:
-            history_text += f"  Notes: {r['notes']}\n"
-
-    await update.message.reply_text(history_text, reply_markup=MAIN_KEYBOARD)
-
-
-async def set_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Please enter your age:")
-    return SETTING_AGE
-
-
-async def receive_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        age = int(update.message.text.strip())
-        if 1 <= age <= 120:
-            update_user_info(update.effective_user.id, age=age)
-            await update.message.reply_text(f"Age saved: {age} years", reply_markup=MAIN_KEYBOARD)
-        else:
-            await update.message.reply_text("Please enter a valid age (1-120)")
-            return SETTING_AGE
-    except ValueError:
-        await update.message.reply_text("Please enter a number")
-        return SETTING_AGE
-    return ConversationHandler.END
-
-
-async def set_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("Male"), KeyboardButton("Female")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await update.message.reply_text("Select your gender:", reply_markup=keyboard)
-    return SETTING_GENDER
-
-
-async def receive_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gender = update.message.text.strip().lower()
-    if gender in ["male", "female"]:
-        update_user_info(update.effective_user.id, gender=gender)
-        await update.message.reply_text(f"Gender saved: {gender}", reply_markup=MAIN_KEYBOARD)
-    else:
-        await update.message.reply_text("Please select Male or Female")
-        return SETTING_GENDER
-    return ConversationHandler.END
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Analyzing the image, please wait...")
-
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    image_bytes = await file.download_as_bytearray()
-
-    caption = update.message.caption or ""
-
-    try:
-        response = analyze_medical_image(bytes(image_bytes), "jpeg", caption)
-        user_id = update.effective_user.id
-        save_conversation(user_id, "user", f"[Image sent] {caption}")
-        save_conversation(user_id, "assistant", response)
-        await update.message.reply_text(response, reply_markup=MAIN_KEYBOARD)
-    except Exception as e:
-        logger.error(f"Error analyzing image: {e}")
-        await update.message.reply_text(
-            "Failed to analyze the image. Please try again.",
-            reply_markup=MAIN_KEYBOARD
-        )
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text
-    user_info = get_user_info(user_id)
-
-    button_handlers = {
-        "weight": handle_weight,
-        "nutrition": handle_nutrition,
-        "activity": handle_activity,
-        "analysis": handle_analysis_prompt,
-        "health score": handle_health_score,
-        "screening plan": handle_screening_plan,
-        "my profile": handle_profile,
-        "history": handle_history
-    }
-
-    text_lower = text.lower()
-    if text_lower in button_handlers:
-        await button_handlers[text_lower](update, context)
-        return
-
-    expecting = context.user_data.get("expecting")
-    if expecting in ["weight", "nutrition", "activity"]:
-        save_health_record(user_id, expecting, text)
-        context.user_data.pop("expecting", None)
-
-        messages = get_conversation_history(user_id, limit=10)
-        messages = [{"role": m["role"], "content": m["content"]} for m in messages]
-        messages.append({
-            "role": "user",
-            "content": f"I recorded my {expecting}: {text}. Please comment briefly and give advice if needed."
-        })
-
-        response = chat_with_claude(messages, user_info)
-        save_conversation(user_id, "user", f"{expecting}: {text}")
-        save_conversation(user_id, "assistant", response)
-        await update.message.reply_text(response, reply_markup=MAIN_KEYBOARD)
-        return
-
-    history = get_conversation_history(user_id, limit=20)
-    messages = [{"role": m["role"], "content": m["content"]} for m in history]
-    messages.append({"role": "user", "content": text})
-
-    save_conversation(user_id, "user", text)
-
-    try:
-        response = chat_with_claude(messages, user_info)
-        save_conversation(user_id, "assistant", response)
-        await update.message.reply_text(response, reply_markup=MAIN_KEYBOARD)
-    except Exception as e:
-        logger.error(f"Error calling Claude API: {e}")
-        await update.message.reply_text(
-            "Sorry, an error occurred. Please try again later.",
-            reply_markup=MAIN_KEYBOARD
-        )
-
-
-async def handle_analysis_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send a photo of your medical test or analysis result, "
-        "and I will help you understand the values."
-    )
-
-
-def main():
-    init_db()
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    age_conv = ConversationHandler(
-        entry_points=[CommandHandler("setage", set_age)],
-        states={SETTING_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_age)]},
-        fallbacks=[]
-    )
-
-    gender_conv = ConversationHandler(
-        entry_points=[CommandHandler("setgender", set_gender)],
-        states={SETTING_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_gender)]},
-        fallbacks=[]
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("profile", handle_profile))
-    app.add_handler(age_conv)
-    app.add_handler(gender_conv)
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    logger.info("Bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
-ENDOFFILE
-
-          # requirements.txt
-          cat > requirements.txt << 'ENDOFFILE'
-python-telegram-bot==21.6
-anthropic==0.34.0
-python-dotenv==1.0.1
-ENDOFFILE
-
-          # Procfile
-          cat > Procfile << 'ENDOFFILE'
-worker: python bot.py
-ENDOFFILE
-
-          echo "All files rewritten successfully"
-
-      - name: Configure Git
+          python3 - << 'EOF'
+          import os
+
+          q = chr(34)
+          sq = chr(39)
+          ru = lambda s: s
+
+          files = {}
+
+          files["config.py"] = (
+            "import os\n"
+            "from dotenv import load_dotenv\n"
+            "\n"
+            "load_dotenv()\n"
+            "\n"
+            "TELEGRAM_TOKEN = os.getenv(" + q + "TELEGRAM_TOKEN" + q + ")\n"
+            "ANTHROPIC_API_KEY = os.getenv(" + q + "ANTHROPIC_API_KEY" + q + ")\n"
+            "DATABASE_PATH = " + q + "health_bot.db" + q + "\n"
+            "CLAUDE_MODEL = " + q + "claude-opus-4-5" + q + "\n"
+            "MAX_TOKENS = 2048\n"
+          )
+
+          files["requirements.txt"] = (
+            "python-telegram-bot==21.6\n"
+            "anthropic==0.34.0\n"
+            "python-dotenv==1.0.1\n"
+          )
+
+          files["Procfile"] = "worker: python bot.py\n"
+
+          files["database.py"] = (
+            "import sqlite3\n"
+            "from config import DATABASE_PATH\n"
+            "\n"
+            "def get_connection():\n"
+            "    conn = sqlite3.connect(DATABASE_PATH)\n"
+            "    conn.row_factory = sqlite3.Row\n"
+            "    return conn\n"
+            "\n"
+            "def init_db():\n"
+            "    conn = get_connection()\n"
+            "    c = conn.cursor()\n"
+            "    c.execute(" + q + q + q + "\n"
+            "        CREATE TABLE IF NOT EXISTS users (\n"
+            "            user_id INTEGER PRIMARY KEY,\n"
+            "            username TEXT,\n"
+            "            first_name TEXT,\n"
+            "            age INTEGER,\n"
+            "            gender TEXT,\n"
+            "            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n"
+            "        )\n"
+            "    " + q + q + q + ")\n"
+            "    c.execute(" + q + q + q + "\n"
+            "        CREATE TABLE IF NOT EXISTS health_records (\n"
+            "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+            "            user_id INTEGER,\n"
+            "            record_type TEXT,\n"
+            "            value TEXT,\n"
+            "            notes TEXT,\n"
+            "            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n"
+            "            FOREIGN KEY (user_id) REFERENCES users(user_id)\n"
+            "        )\n"
+            "    " + q + q + q + ")\n"
+            "    c.execute(" + q + q + q + "\n"
+            "        CREATE TABLE IF NOT EXISTS conversations (\n"
+            "            id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+            "            user_id INTEGER,\n"
+            "            role TEXT,\n"
+            "            content TEXT,\n"
+            "            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n"
+            "            FOREIGN KEY (user_id) REFERENCES users(user_id)\n"
+            "        )\n"
+            "    " + q + q + q + ")\n"
+            "    conn.commit()\n"
+            "    conn.close()\n"
+            "\n"
+            "def save_user(user_id, username, first_name):\n"
+            "    conn = get_connection()\n"
+            "    c = conn.cursor()\n"
+            "    c.execute(\n"
+            "        " + q + "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)" + q + ",\n"
+            "        (user_id, username, first_name)\n"
+            "    )\n"
+            "    conn.commit()\n"
+            "    conn.close()\n"
+            "\n"
+            "def save_health_record(user_id, record_type, value, notes=" + q + q + "):\n"
+            "    conn = get_connection()\n"
+            "    c = conn.cursor()\n"
+            "    c.execute(\n"
+            "        " + q + "INSERT INTO health_records (user_id, record_type, value, notes) VALUES (?, ?, ?, ?)" + q + ",\n"
+            "        (user_id, record_type, value, notes)\n"
+            "    )\n"
+            "    conn.commit()\n"
+            "    conn.close()\n"
+            "\n"
+            "def get_health_records(user_id, record_type=None, limit=10):\n"
+            "    conn = get_connection()\n"
+            "    c = conn.cursor()\n"
+            "    if record_type:\n"
+            "        c.execute(\n"
+            "            " + q + "SELECT * FROM health_records WHERE user_id=? AND record_type=? ORDER BY recorded_at DESC LIMIT ?" + q + ",\n"
+            "            (user_id, record_type, limit)\n"
+            "        )\n"
+            "    else:\n"
+            "        c.execute(\n"
+            "            " + q + "SELECT * FROM health_records WHERE user_id=? ORDER BY recorded_at DESC LIMIT ?" + q + ",\n"
+            "            (user_id, limit)\n"
+            "        )\n"
+            "    rows = c.fetchall()\n"
+            "    conn.close()\n"
+            "    return rows\n"
+            "\n"
+            "def save_conversation(user_id, role, content):\n"
+            "    conn = get_connection()\n"
+            "    c = conn.cursor()\n"
+            "    c.execute(\n"
+            "        " + q + "INSERT INTO conversations (user_id, role, content) VALUES (?, ?, ?)" + q + ",\n"
+            "        (user_id, role, content)\n"
+            "    )\n"
+            "    conn.commit()\n"
+            "    conn.close()\n"
+            "\n"
+            "def get_conversation_history(user_id, limit=20):\n"
+            "    conn = get_connection()\n"
+            "    c = conn.cursor()\n"
+            "    c.execute(\n"
+            "        " + q + "SELECT role, content FROM conversations WHERE user_id=? ORDER BY created_at DESC LIMIT ?" + q + ",\n"
+            "        (user_id, limit)\n"
+            "    )\n"
+            "    rows = c.fetchall()\n"
+            "    conn.close()\n"
+            "    return list(reversed(rows))\n"
+            "\n"
+            "def get_user_info(user_id):\n"
+            "    conn = get_connection()\n"
+            "    c = conn.cursor()\n"
+            "    c.execute(" + q + "SELECT * FROM users WHERE user_id=?" + q + ", (user_id,))\n"
+            "    user = c.fetchone()\n"
+            "    conn.close()\n"
+            "    return user\n"
+            "\n"
+            "def update_user_info(user_id, age=None, gender=None):\n"
+            "    conn = get_connection()\n"
+            "    c = conn.cursor()\n"
+            "    if age is not None:\n"
+            "        c.execute(" + q + "UPDATE users SET age=? WHERE user_id=?" + q + ", (age, user_id))\n"
+            "    if gender is not None:\n"
+            "        c.execute(" + q + "UPDATE users SET gender=? WHERE user_id=?" + q + ", (gender, user_id))\n"
+            "    conn.commit()\n"
+            "    conn.close()\n"
+          )
+
+          files["claude_client.py"] = (
+            "import anthropic\n"
+            "import base64\n"
+            "from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MAX_TOKENS\n"
+            "\n"
+            "client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)\n"
+            "\n"
+            "SYSTEM_PROMPT = " + q + q + q + "\n"
+            "You are an AI health assistant and personal doctor for Russian-speaking users.\n"
+            "ALWAYS respond in Russian, regardless of what language the user writes in.\n"
+            "\n"
+            "You help users:\n"
+            "- Track their weight, nutrition, and physical activity\n"
+            "- Analyze medical test results from photos\n"
+            "- Create health screening plans based on age and gender\n"
+            "- Assess overall health on a scale of 1-10\n"
+            "- Answer medical questions\n"
+            "\n"
+            "Important rules:\n"
+            "- ALWAYS write in Russian\n"
+            "- Always remind users that you are an AI and cannot replace a real doctor\n"
+            "- For serious symptoms, always recommend consulting a doctor\n"
+            "- Be empathetic, warm, and supportive\n"
+            "- Use simple language, avoid complex medical terms without explanation\n"
+            "- When assessing health score, explain what each point means\n"
+            + q + q + q + "\n"
+            "\n"
+            "def chat_with_claude(messages, user_info=None):\n"
+            "    system = SYSTEM_PROMPT\n"
+            "    if user_info and (user_info[" + q + "age" + q + "] or user_info[" + q + "gender" + q + "]):\n"
+            "        age = user_info[" + q + "age" + q + "] or " + q + "не указан" + q + "\n"
+            "        gender = user_info[" + q + "gender" + q + "] or " + q + "не указан" + q + "\n"
+            "        system += " + q + "\\n\\nПрофиль пользователя: возраст " + q + " + str(age) + " + q + ", пол: " + q + " + str(gender)\n"
+            "    response = client.messages.create(\n"
+            "        model=CLAUDE_MODEL,\n"
+            "        max_tokens=MAX_TOKENS,\n"
+            "        system=system,\n"
+            "        messages=messages\n"
+            "    )\n"
+            "    return response.content[0].text\n"
+            "\n"
+            "def analyze_medical_image(image_data, image_type=" + q + "jpeg" + q + ", user_message=" + q + q + "):\n"
+            "    if isinstance(image_data, bytes):\n"
+            "        image_b64 = base64.standard_b64encode(image_data).decode(" + q + "utf-8" + q + ")\n"
+            "    else:\n"
+            "        image_b64 = image_data\n"
+            "    prompt = user_message if user_message else " + q + "Проанализируй этот медицинский документ или результат анализа. Объясни значения на русском языке и укажи, если что-то требует внимания." + q + "\n"
+            "    response = client.messages.create(\n"
+            "        model=CLAUDE_MODEL,\n"
+            "        max_tokens=MAX_TOKENS,\n"
+            "        system=SYSTEM_PROMPT,\n"
+            "        messages=[{\n"
+            "            " + q + "role" + q + ": " + q + "user" + q + ",\n"
+            "            " + q + "content" + q + ": [\n"
+            "                {" + q + "type" + q + ": " + q + "image" + q + ", " + q + "source" + q + ": {" + q + "type" + q + ": " + q + "base64" + q + ", " + q + "media_type" + q + ": " + q + "image/" + q + " + image_type, " + q + "data" + q + ": image_b64}},\n"
+            "                {" + q + "type" + q + ": " + q + "text" + q + ", " + q + "text" + q + ": prompt}\n"
+            "            ]\n"
+            "        }]\n"
+            "    )\n"
+            "    return response.content[0].text\n"
+          )
+
+          files["bot.py"] = (
+            "import logging\n"
+            "from telegram import Update, ReplyKeyboardMarkup, KeyboardButton\n"
+            "from telegram.ext import (\n"
+            "    Application, CommandHandler, MessageHandler,\n"
+            "    filters, ContextTypes, ConversationHandler\n"
+            ")\n"
+            "from config import TELEGRAM_TOKEN\n"
+            "from database import (\n"
+            "    init_db, save_user, save_health_record, get_health_records,\n"
+            "    save_conversation, get_conversation_history,\n"
+            "    get_user_info, update_user_info\n"
+            ")\n"
+            "from claude_client import chat_with_claude, analyze_medical_image\n"
+            "\n"
+            "logging.basicConfig(\n"
+            "    format=" + q + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + q + ",\n"
+            "    level=logging.INFO\n"
+            ")\n"
+            "logger = logging.getLogger(__name__)\n"
+            "\n"
+            "SETTING_AGE, SETTING_GENDER = range(2)\n"
+            "\n"
+            "MAIN_KB = ReplyKeyboardMarkup([\n"
+            "    [KeyboardButton(" + q + "\u2696\ufe0f \u0412\u0435\u0441" + q + "), KeyboardButton(" + q + "\ud83e\udd57 \u041f\u0438\u0442\u0430\u043d\u0438\u0435" + q + ")],\n"
+            "    [KeyboardButton(" + q + "\ud83c\udfcb\ufe0f \u0410\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c" + q + "), KeyboardButton(" + q + "\ud83d\udd2c \u0410\u043d\u0430\u043b\u0438\u0437\u044b" + q + ")],\n"
+            "    [KeyboardButton(" + q + "\ud83d\udcca \u041e\u0446\u0435\u043d\u043a\u0430 \u0437\u0434\u043e\u0440\u043e\u0432\u044c\u044f" + q + "), KeyboardButton(" + q + "\ud83d\udcc5 \u041f\u043b\u0430\u043d \u043e\u0431\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u0439" + q + ")],\n"
+            "    [KeyboardButton(" + q + "\ud83d\udc64 \u041c\u043e\u0439 \u043f\u0440\u043e\u0444\u0438\u043b\u044c" + q + "), KeyboardButton(" + q + "\ud83d\udcdd \u0418\u0441\u0442\u043e\u0440\u0438\u044f" + q + ")]\n"
+            "], resize_keyboard=True)\n"
+            "\n"
+            "async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    user = update.effective_user\n"
+            "    save_user(user.id, user.username, user.first_name)\n"
+            "    text = (\n"
+            "        " + q + "\ud83d\udc68\u200d\u2695\ufe0f \u0417\u0434\u0440\u0430\u0432\u0441\u0442\u0432\u0443\u0439\u0442\u0435, " + q + " + user.first_name + " + q + "!\\n\\n" + q + "\n"
+            "        " + q + "\u042f \u0432\u0430\u0448 \u043b\u0438\u0447\u043d\u044b\u0439 \u0418\u0418-\u0434\u043e\u043a\u0442\u043e\u0440. \u041c\u043e\u0433\u0443 \u043f\u043e\u043c\u043e\u0447\u044c:\\n\\n" + q + "\n"
+            "        " + q + "\u2696\ufe0f \u041e\u0442\u0441\u043b\u0435\u0436\u0438\u0432\u0430\u0442\u044c \u0432\u0435\u0441, \u043f\u0438\u0442\u0430\u043d\u0438\u0435, \u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c\\n" + q + "\n"
+            "        " + q + "\ud83d\udd2c \u0420\u0430\u0441\u0448\u0438\u0444\u0440\u043e\u0432\u044b\u0432\u0430\u0442\u044c \u043c\u0435\u0434\u0438\u0446\u0438\u043d\u0441\u043a\u0438\u0435 \u0430\u043d\u0430\u043b\u0438\u0437\u044b \u043f\u043e \u0444\u043e\u0442\u043e\\n" + q + "\n"
+            "        " + q + "\ud83d\udcc5 \u0421\u043e\u0441\u0442\u0430\u0432\u043b\u044f\u0442\u044c \u043f\u043b\u0430\u043d \u043e\u0431\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u0439\\n" + q + "\n"
+            "        " + q + "\ud83d\udcca \u041e\u0446\u0435\u043d\u0438\u0432\u0430\u0442\u044c \u0437\u0434\u043e\u0440\u043e\u0432\u044c\u0435 \u043f\u043e \u0448\u043a\u0430\u043b\u0435 1-10\\n\\n" + q + "\n"
+            "        " + q + "\u2757\ufe0f \u042f \u044f\u0432\u043b\u044f\u044e\u0441\u044c \u0418\u0418-\u0430\u0441\u0441\u0438\u0441\u0442\u0435\u043d\u0442\u043e\u043c \u0438 \u043d\u0435 \u0437\u0430\u043c\u0435\u043d\u044f\u044e \u0440\u0435\u0430\u043b\u044c\u043d\u043e\u0433\u043e \u0432\u0440\u0430\u0447\u0430." + q + "\n"
+            "    )\n"
+            "    await update.message.reply_text(text, reply_markup=MAIN_KB)\n"
+            "\n"
+            "async def handle_health_score(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    user_id = update.effective_user.id\n"
+            "    records = get_health_records(user_id, limit=20)\n"
+            "    history = get_conversation_history(user_id, limit=10)\n"
+            "    user_info = get_user_info(user_id)\n"
+            "    records_text = " + q + q + "\n"
+            "    for r in records[:10]:\n"
+            "        records_text += " + q + "- " + q + " + r[" + q + "record_type" + q + "] + " + q + ": " + q + " + r[" + q + "value" + q + "] + " + q + "\\n" + q + "\n"
+            "    msgs = [{" + q + "role" + q + ": m[" + q + "role" + q + "], " + q + "content" + q + ": m[" + q + "content" + q + "]} for m in history[-6:]]\n"
+            "    msgs.append({" + q + "role" + q + ": " + q + "user" + q + ", " + q + "content" + q + ": " + q + "\u041e\u0446\u0435\u043d\u0438 \u043c\u043e\u0451 \u0437\u0434\u043e\u0440\u043e\u0432\u044c\u0435 \u043f\u043e \u0448\u043a\u0430\u043b\u0435 1-10 \u043d\u0430 \u043e\u0441\u043d\u043e\u0432\u0435 \u0434\u0430\u043d\u043d\u044b\u0445:\\n" + q + " + (records_text or " + q + "\u0414\u0430\u043d\u043d\u044b\u0445 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442" + q + ")})\n"
+            "    response = chat_with_claude(msgs, user_info)\n"
+            "    await update.message.reply_text(response, reply_markup=MAIN_KB)\n"
+            "\n"
+            "async def handle_screening_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    user_id = update.effective_user.id\n"
+            "    user_info = get_user_info(user_id)\n"
+            "    if not user_info or not user_info[" + q + "age" + q + "] or not user_info[" + q + "gender" + q + "]:\n"
+            "        await update.message.reply_text(\n"
+            "            " + q + "\u041f\u043e\u0436\u0430\u043b\u0443\u0439\u0441\u0442\u0430, \u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u0443\u043a\u0430\u0436\u0438\u0442\u0435 \u0432\u043e\u0437\u0440\u0430\u0441\u0442 \u0438 \u043f\u043e\u043b \u0432 \u043f\u0440\u043e\u0444\u0438\u043b\u0435.\\n\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 \u043a\u043e\u043c\u0430\u043d\u0434\u044b /setage \u0438 /setgender" + q + "\n"
+            "        )\n"
+            "        return\n"
+            "    msgs = [{\n"
+            "        " + q + "role" + q + ": " + q + "user" + q + ",\n"
+            "        " + q + "content" + q + ": " + q + "\u0421\u043e\u0441\u0442\u0430\u0432\u044c \u043f\u043b\u0430\u043d \u043e\u0431\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u0439 \u0434\u043b\u044f \u0447\u0435\u043b\u043e\u0432\u0435\u043a\u0430: \u0432\u043e\u0437\u0440\u0430\u0441\u0442 " + q + " + str(user_info[" + q + "age" + q + "]) + " + q + " \u043b\u0435\u0442, \u043f\u043e\u043b: " + q + " + str(user_info[" + q + "gender" + q + "])\n"
+            "    }]\n"
+            "    response = chat_with_claude(msgs, user_info)\n"
+            "    save_conversation(user_id, " + q + "user" + q + ", " + q + "\u041f\u043b\u0430\u043d \u043e\u0431\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u043d\u0438\u0439" + q + ")\n"
+            "    save_conversation(user_id, " + q + "assistant" + q + ", response)\n"
+            "    await update.message.reply_text(response, reply_markup=MAIN_KB)\n"
+            "\n"
+            "async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    user_id = update.effective_user.id\n"
+            "    u = get_user_info(user_id)\n"
+            "    text = (\n"
+            "        " + q + "\ud83d\udc64 \u0412\u0430\u0448 \u043f\u0440\u043e\u0444\u0438\u043b\u044c:\\n\\n" + q + "\n"
+            "        " + q + "\u0418\u043c\u044f: " + q + " + (u[" + q + "first_name" + q + "] if u else " + q + "\u041d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e" + q + ") + " + q + "\\n" + q + "\n"
+            "        " + q + "\u0412\u043e\u0437\u0440\u0430\u0441\u0442: " + q + " + str(u[" + q + "age" + q + "] if u and u[" + q + "age" + q + "] else " + q + "\u041d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d" + q + ") + " + q + "\\n" + q + "\n"
+            "        " + q + "\u041f\u043e\u043b: " + q + " + str(u[" + q + "gender" + q + "] if u and u[" + q + "gender" + q + "] else " + q + "\u041d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d" + q + ") + " + q + "\\n\\n" + q + "\n"
+            "        " + q + "\u0414\u043b\u044f \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f: /setage \u0438 /setgender" + q + "\n"
+            "    )\n"
+            "    await update.message.reply_text(text, reply_markup=MAIN_KB)\n"
+            "\n"
+            "async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    user_id = update.effective_user.id\n"
+            "    records = get_health_records(user_id, limit=10)\n"
+            "    if not records:\n"
+            "        await update.message.reply_text(" + q + "\u0417\u0430\u043f\u0438\u0441\u0435\u0439 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442." + q + ", reply_markup=MAIN_KB)\n"
+            "        return\n"
+            "    text = " + q + "\ud83d\udcdd \u0412\u0430\u0448\u0438 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 \u0437\u0430\u043f\u0438\u0441\u0438:\\n\\n" + q + "\n"
+            "    for r in records:\n"
+            "        text += str(r[" + q + "recorded_at" + q + "])[:10] + " + q + " \u2014 " + q + " + r[" + q + "record_type" + q + "] + " + q + ": " + q + " + r[" + q + "value" + q + "] + " + q + "\\n" + q + "\n"
+            "    await update.message.reply_text(text, reply_markup=MAIN_KB)\n"
+            "\n"
+            "async def set_age(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    await update.message.reply_text(" + q + "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u0432\u0430\u0448 \u0432\u043e\u0437\u0440\u0430\u0441\u0442:" + q + ")\n"
+            "    return SETTING_AGE\n"
+            "\n"
+            "async def receive_age(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    try:\n"
+            "        age = int(update.message.text.strip())\n"
+            "        if 1 <= age <= 120:\n"
+            "            update_user_info(update.effective_user.id, age=age)\n"
+            "            await update.message.reply_text(" + q + "\u2705 \u0412\u043e\u0437\u0440\u0430\u0441\u0442 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d: " + q + " + str(age) + " + q + " \u043b\u0435\u0442" + q + ", reply_markup=MAIN_KB)\n"
+            "        else:\n"
+            "            await update.message.reply_text(" + q + "\u041f\u043e\u0436\u0430\u043b\u0443\u0439\u0441\u0442\u0430, \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 \u0432\u043e\u0437\u0440\u0430\u0441\u0442 (1-120)" + q + ")\n"
+            "            return SETTING_AGE\n"
+            "    except ValueError:\n"
+            "        await update.message.reply_text(" + q + "\u041f\u043e\u0436\u0430\u043b\u0443\u0439\u0441\u0442\u0430, \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0447\u0438\u0441\u043b\u043e" + q + ")\n"
+            "        return SETTING_AGE\n"
+            "    return ConversationHandler.END\n"
+            "\n"
+            "async def set_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    kb = ReplyKeyboardMarkup(\n"
+            "        [[KeyboardButton(" + q + "\u041c\u0443\u0436\u0441\u043a\u043e\u0439" + q + "), KeyboardButton(" + q + "\u0416\u0435\u043d\u0441\u043a\u043e\u0439" + q + ")]],\n"
+            "        resize_keyboard=True, one_time_keyboard=True\n"
+            "    )\n"
+            "    await update.message.reply_text(" + q + "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043f\u043e\u043b:" + q + ", reply_markup=kb)\n"
+            "    return SETTING_GENDER\n"
+            "\n"
+            "async def receive_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    gender_map = {" + q + "\u043c\u0443\u0436\u0441\u043a\u043e\u0439" + q + ": " + q + "\u043c\u0443\u0436\u0441\u043a\u043e\u0439" + q + ", " + q + "\u0436\u0435\u043d\u0441\u043a\u043e\u0439" + q + ": " + q + "\u0436\u0435\u043d\u0441\u043a\u043e\u0439" + q + "}\n"
+            "    gender = gender_map.get(update.message.text.strip().lower())\n"
+            "    if gender:\n"
+            "        update_user_info(update.effective_user.id, gender=gender)\n"
+            "        await update.message.reply_text(" + q + "\u2705 \u041f\u043e\u043b \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d: " + q + " + gender, reply_markup=MAIN_KB)\n"
+            "    else:\n"
+            "        await update.message.reply_text(" + q + "\u041f\u043e\u0436\u0430\u043b\u0443\u0439\u0441\u0442\u0430, \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u041c\u0443\u0436\u0441\u043a\u043e\u0439 \u0438\u043b\u0438 \u0416\u0435\u043d\u0441\u043a\u043e\u0439" + q + ")\n"
+            "        return SETTING_GENDER\n"
+            "    return ConversationHandler.END\n"
+            "\n"
+            "async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    await update.message.reply_text(" + q + "\ud83d\udd0d \u0410\u043d\u0430\u043b\u0438\u0437\u0438\u0440\u0443\u044e \u0438\u0437\u043e\u0431\u0440\u0430\u0436\u0435\u043d\u0438\u0435, \u043f\u043e\u0434\u043e\u0436\u0434\u0438\u0442\u0435..." + q + ")\n"
+            "    photo = update.message.photo[-1]\n"
+            "    file = await context.bot.get_file(photo.file_id)\n"
+            "    image_bytes = await file.download_as_bytearray()\n"
+            "    caption = update.message.caption or " + q + q + "\n"
+            "    try:\n"
+            "        response = analyze_medical_image(bytes(image_bytes), " + q + "jpeg" + q + ", caption)\n"
+            "        save_conversation(update.effective_user.id, " + q + "user" + q + ", " + q + "[\u0424\u043e\u0442\u043e \u0430\u043d\u0430\u043b\u0438\u0437\u0430]" + q + ")\n"
+            "        save_conversation(update.effective_user.id, " + q + "assistant" + q + ", response)\n"
+            "        await update.message.reply_text(response, reply_markup=MAIN_KB)\n"
+            "    except Exception as e:\n"
+            "        logger.error(" + q + "Image error: " + q + " + str(e))\n"
+            "        await update.message.reply_text(" + q + "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0430\u043d\u0430\u043b\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0444\u043e\u0442\u043e. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0435\u0449\u0451 \u0440\u0430\u0437." + q + ", reply_markup=MAIN_KB)\n"
+            "\n"
+            "async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):\n"
+            "    user_id = update.effective_user.id\n"
+            "    text = update.message.text\n"
+            "    user_info = get_user_info(user_id)\n"
+            "    tl = text.lower().strip()\n"
+            "\n"
+            "    if " + q + "\u0432\u0435\u0441" + q + " in tl:\n"
+            "        await update.message.reply_text(" + q + "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u0432\u0430\u0448 \u0432\u0435\u0441 \u0432 \u043a\u0433 (\u043d\u0430\u043f\u0440\u0438\u043c\u0435\u0440: 70.5):" + q + ")\n"
+            "        context.user_data[" + q + "expecting" + q + "] = " + q + "\u0432\u0435\u0441" + q + "\n"
+            "        return\n"
+            "    if " + q + "\u043f\u0438\u0442\u0430\u043d\u0438\u0435" + q + " in tl:\n"
+            "        await update.message.reply_text(" + q + "\u041e\u043f\u0438\u0448\u0438\u0442\u0435, \u0447\u0442\u043e \u0432\u044b \u0441\u0435\u0433\u043e\u0434\u043d\u044f \u0435\u043b\u0438:" + q + ")\n"
+            "        context.user_data[" + q + "expecting" + q + "] = " + q + "\u043f\u0438\u0442\u0430\u043d\u0438\u0435" + q + "\n"
+            "        return\n"
+            "    if " + q + "\u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c" + q + " in tl:\n"
+            "        await update.message.reply_text(" + q + "\u041e\u043f\u0438\u0448\u0438\u0442\u0435 \u0432\u0430\u0448\u0443 \u0444\u0438\u0437\u0438\u0447\u0435\u0441\u043a\u0443\u044e \u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c:" + q + ")\n"
+            "        context.user_data[" + q + "expecting" + q + "] = " + q + "\u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c" + q + "\n"
+            "        return\n"
+            "    if " + q + "\u0430\u043d\u0430\u043b\u0438\u0437" + q + " in tl:\n"
+            "        await update.message.reply_text(" + q + "\u041e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u0444\u043e\u0442\u043e \u0432\u0430\u0448\u0435\u0433\u043e \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442\u0430 \u0430\u043d\u0430\u043b\u0438\u0437\u0430." + q + ")\n"
+            "        return\n"
+            "    if " + q + "\u043e\u0446\u0435\u043d\u043a\u0430" + q + " in tl:\n"
+            "        await handle_health_score(update, context)\n"
+            "        return\n"
+            "    if " + q + "\u043f\u043b\u0430\u043d" + q + " in tl:\n"
+            "        await handle_screening_plan(update, context)\n"
+            "        return\n"
+            "    if " + q + "\u043f\u0440\u043e\u0444\u0438\u043b\u044c" + q + " in tl:\n"
+            "        await handle_profile(update, context)\n"
+            "        return\n"
+            "    if " + q + "\u0438\u0441\u0442\u043e\u0440\u0438\u044f" + q + " in tl:\n"
+            "        await handle_history(update, context)\n"
+            "        return\n"
+            "\n"
+            "    expecting = context.user_data.get(" + q + "expecting" + q + ")\n"
+            "    if expecting in [" + q + "\u0432\u0435\u0441" + q + ", " + q + "\u043f\u0438\u0442\u0430\u043d\u0438\u0435" + q + ", " + q + "\u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c" + q + "]:\n"
+            "        save_health_record(user_id, expecting, text)\n"
+            "        context.user_data.pop(" + q + "expecting" + q + ", None)\n"
+            "        history = get_conversation_history(user_id, limit=10)\n"
+            "        msgs = [{" + q + "role" + q + ": m[" + q + "role" + q + "], " + q + "content" + q + ": m[" + q + "content" + q + "]} for m in history]\n"
+            "        msgs.append({" + q + "role" + q + ": " + q + "user" + q + ", " + q + "content" + q + ": " + q + "\u042f \u0437\u0430\u043f\u0438\u0441\u0430\u043b " + q + " + expecting + " + q + ": " + q + " + text + " + q + ". \u041f\u0440\u043e\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0438\u0440\u0443\u0439 \u043a\u0440\u0430\u0442\u043a\u043e." + q + "})\n"
+            "        response = chat_with_claude(msgs, user_info)\n"
+            "        save_conversation(user_id, " + q + "user" + q + ", expecting + " + q + ": " + q + " + text)\n"
+            "        save_conversation(user_id, " + q + "assistant" + q + ", response)\n"
+            "        await update.message.reply_text(response, reply_markup=MAIN_KB)\n"
+            "        return\n"
+            "\n"
+            "    history = get_conversation_history(user_id, limit=20)\n"
+            "    msgs = [{" + q + "role" + q + ": m[" + q + "role" + q + "], " + q + "content" + q + ": m[" + q + "content" + q + "]} for m in history]\n"
+            "    msgs.append({" + q + "role" + q + ": " + q + "user" + q + ", " + q + "content" + q + ": text})\n"
+            "    save_conversation(user_id, " + q + "user" + q + ", text)\n"
+            "    try:\n"
+            "        response = chat_with_claude(msgs, user_info)\n"
+            "        save_conversation(user_id, " + q + "assistant" + q + ", response)\n"
+            "        await update.message.reply_text(response, reply_markup=MAIN_KB)\n"
+            "    except Exception as e:\n"
+            "        logger.error(" + q + "Claude error: " + q + " + str(e))\n"
+            "        await update.message.reply_text(" + q + "\u041f\u0440\u043e\u0438\u0437\u043e\u0448\u043b\u0430 \u043e\u0448\u0438\u0431\u043a\u0430. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0435\u0449\u0451 \u0440\u0430\u0437." + q + ", reply_markup=MAIN_KB)\n"
+            "\n"
+            "def main():\n"
+            "    init_db()\n"
+            "    app = Application.builder().token(TELEGRAM_TOKEN).build()\n"
+            "    age_conv = ConversationHandler(\n"
+            "        entry_points=[CommandHandler(" + q + "setage" + q + ", set_age)],\n"
+            "        states={SETTING_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_age)]},\n"
+            "        fallbacks=[]\n"
+            "    )\n"
+            "    gender_conv = ConversationHandler(\n"
+            "        entry_points=[CommandHandler(" + q + "setgender" + q + ", set_gender)],\n"
+            "        states={SETTING_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_gender)]},\n"
+            "        fallbacks=[]\n"
+            "    )\n"
+            "    app.add_handler(CommandHandler(" + q + "start" + q + ", start))\n"
+            "    app.add_handler(CommandHandler(" + q + "profile" + q + ", handle_profile))\n"
+            "    app.add_handler(age_conv)\n"
+            "    app.add_handler(gender_conv)\n"
+            "    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))\n"
+            "    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))\n"
+            "    logger.info(" + q + "\u0411\u043e\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d" + q + ")\n"
+            "    app.run_polling(allowed_updates=Update.ALL_TYPES)\n"
+            "\n"
+            "if __name__ == " + q + "__main__" + q + ":\n"
+            "    main()\n"
+          )
+
+          for filename, content in files.items():
+              with open(filename, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print("Written: " + filename)
+
+          print("All done!")
+          EOF
+
+      - name: Verify no smart quotes
+        run: |
+          python3 -c "
+          import sys
+          bad = [chr(0x2018), chr(0x2019), chr(0x201C), chr(0x201D)]
+          files = ['bot.py', 'claude_client.py', 'database.py', 'config.py']
+          ok = True
+          for f in files:
+              text = open(f, encoding='utf-8').read()
+              for ch in bad:
+                  if ch in text:
+                      print('BAD CHAR in ' + f + ': ' + repr(ch))
+                      ok = False
+          if ok:
+              print('All files clean - no smart quotes found')
+          else:
+              sys.exit(1)
+          "
+
+      - name: Commit and push
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
-
-      - name: Commit and push fixed files
-        run: |
           git add bot.py claude_client.py database.py config.py requirements.txt Procfile
-          git diff --staged --quiet || git commit -m "fix: rewrite all files with clean ASCII code [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: rewrite all files in Russian, clean ASCII [skip ci]"
           git push
