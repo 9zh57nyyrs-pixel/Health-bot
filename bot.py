@@ -55,7 +55,7 @@ else:
 ```
 
 async def setup_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-context.user_data[‘name’] = update.message.text.strip()
+context.user_data['name'] = update.message.text.strip()
 await update.message.reply_text(“Сколько вам лет?”)
 return SETUP_AGE
 
