@@ -132,7 +132,7 @@ except ValueError:
 ```
 
 async def log_weight_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-await update.message.reply_text(“Введите ваш текущий вес в кг (например: 72.3):”)
+await update.message.reply_text("Введите ваш текущий вес в кг (например: 72.3):")
 return LOG_WEIGHT
 
 async def log_weight_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
