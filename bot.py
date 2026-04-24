@@ -386,7 +386,7 @@ await update.message.reply_text(profile, parse_mode='Markdown', reply_markup=get
 ```
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-“”“Handle photos - analyze as medical tests/documents”””
+"""Handle photos - analyze as medical tests/documents"""
 user_id = update.effective_user.id
 user = db.get_user(user_id)
 
