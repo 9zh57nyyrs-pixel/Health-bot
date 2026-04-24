@@ -522,7 +522,7 @@ except Exception as e:
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 context.user_data.clear()
-await update.message.reply_text(“Действие отменено.”, reply_markup=get_main_keyboard())
+await update.message.reply_text("Действие отменено.", reply_markup=get_main_keyboard())
 return ConversationHandler.END
 
 def main():
