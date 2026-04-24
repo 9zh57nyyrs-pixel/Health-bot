@@ -56,7 +56,7 @@ else:
 
 async def setup_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 context.user_data['name'] = update.message.text.strip()
-await update.message.reply_text(“Сколько вам лет?”)
+await update.message.reply_text("Сколько вам лет?")
 return SETUP_AGE
 
 async def setup_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -64,24 +64,24 @@ try:
 age = int(update.message.text.strip())
 if age < 1 or age > 120:
 raise ValueError
-context.user_data[‘age’] = age
+context.user_data['age'] = age
 keyboard = ReplyKeyboardMarkup(
-[[KeyboardButton(“Мужской”), KeyboardButton(“Женский”)]],
+[[KeyboardButton("Мужской"), KeyboardButton("Женский")]],
 resize_keyboard=True, one_time_keyboard=True
 )
-await update.message.reply_text(“Укажите ваш пол:”, reply_markup=keyboard)
+await update.message.reply_text("Укажите ваш пол:", reply_markup=keyboard)
 return SETUP_GENDER
 except ValueError:
-await update.message.reply_text(“Пожалуйста, введите корректный возраст (число).”)
+await update.message.reply_text("Пожалуйста, введите корректный возраст (число).")
 return SETUP_AGE
 
 async def setup_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
 gender = update.message.text.strip()
-if gender not in [“Мужской”, “Женский”]:
-await update.message.reply_text(“Пожалуйста, выберите ‘Мужской’ или ‘Женский’.”)
+if gender not in ["Мужской", "Женский"]:
+await update.message.reply_text("Пожалуйста, выберите 'Мужской' или 'Женский'.")
 return SETUP_GENDER
-context.user_data[‘gender’] = gender
-await update.message.reply_text(“Укажите ваш рост в сантиметрах (например: 175):”)
+context.user_data['gender'] = gender
+await update.message.reply_text("Укажите ваш рост в сантиметрах (например: 175):")
 return SETUP_HEIGHT
 
 async def setup_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -89,11 +89,11 @@ try:
 height = float(update.message.text.strip())
 if height < 50 or height > 250:
 raise ValueError
-context.user_data[‘height’] = height
-await update.message.reply_text(“Укажите ваш текущий вес в килограммах (например: 70.5):”)
+context.user_data['height'] = height
+await update.message.reply_text("Укажите ваш текущий вес в килограммах (например: 70.5):")
 return SETUP_WEIGHT
 except ValueError:
-await update.message.reply_text(“Пожалуйста, введите корректный рост в см.”)
+await update.message.reply_text("Пожалуйста, введите корректный рост в см.")
 return SETUP_HEIGHT
 
 async def setup_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
