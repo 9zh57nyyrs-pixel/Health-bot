@@ -535,7 +535,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─── Application Bootstrap ────────────────────────────────────────────────────
 
 def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     gemini_key = os.environ.get("GEMINI_API_KEY")
 
     if not token:
