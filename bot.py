@@ -310,4 +310,39 @@ def main():
     application.run_polling()
 
 if __name__ == '__main__':
+    init_db()
+        
+        # Проверка наличия токена перед стартом
+        if not TELEGRAM_TOKEN:
+            logger.error("TELEGRAM_TOKEN не найден в переменных окружения!")
+            return
+
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('start', start), MessageHandler(filters.TEXT & ~filters.COMMAND, start)],
+            states={
+                GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_gender)],
+                AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_age)],
+                WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_weight)],
+                HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_height)],
+                DISEASES: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_diseases)],
+                CHAT_MODE: [
+                    MessageHandler(filters.PHOTO, handle_photo),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+                ],
+            },
+            fallbacks=[CommandHandler('cancel', cancel)],
+            allow_reentry=True
+        )
+
+        application.add_handler(conv_handler)
+        
+        logger.info("Бот инициализирован и запускает polling...")
+        application.run_polling(drop_pending_updates=True) # Игнорируем старые сообщения при краше
+        
+    except Exception as e:
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
+
+if __name__ == '__main__':
     main()
