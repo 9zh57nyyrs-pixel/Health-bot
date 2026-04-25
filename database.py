@@ -21,7 +21,7 @@ def init_db():
         )
     """)
     c.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
+        CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             role TEXT,
@@ -48,36 +48,36 @@ def save_user(user_id, username, first_name):
 def get_user(user_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    user = c.fetchone()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
     conn.close()
-    return user
+    return row
 
 
-def update_profile(user_id, profile_text):
+def save_profile(user_id, profile):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("UPDATE users SET profile=? WHERE user_id=?", (profile_text, user_id))
+    c.execute("UPDATE users SET profile = ? WHERE user_id = ?", (profile, user_id))
     conn.commit()
     conn.close()
 
 
-def save_message(user_id, role, content):
+def add_message(user_id, role, content):
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO conversations (user_id, role, content) VALUES (?, ?, ?)",
+        "INSERT INTO messages (user_id, role, content) VALUES (?, ?, ?)",
         (user_id, role, content)
     )
     conn.commit()
     conn.close()
 
 
-def get_history(user_id, limit=40):
+def get_recent_messages(user_id, limit=30):
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        "SELECT role, content, created_at FROM conversations WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+        "SELECT role, content FROM messages WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
         (user_id, limit)
     )
     rows = c.fetchall()
@@ -85,11 +85,11 @@ def get_history(user_id, limit=40):
     return list(reversed(rows))
 
 
-def get_full_history(user_id):
+def get_all_messages(user_id):
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        "SELECT role, content, created_at FROM conversations WHERE user_id=? ORDER BY created_at ASC",
+        "SELECT role, content, created_at FROM messages WHERE user_id = ? ORDER BY created_at ASC",
         (user_id,)
     )
     rows = c.fetchall()
@@ -97,9 +97,9 @@ def get_full_history(user_id):
     return rows
 
 
-def clear_history(user_id):
+def clear_messages(user_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM conversations WHERE user_id=?", (user_id,))
+    c.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
