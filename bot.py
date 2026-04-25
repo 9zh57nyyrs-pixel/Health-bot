@@ -2,65 +2,92 @@ import os
 import sqlite3
 import google.generativeai as genai
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.constants import ChatAction
 
 # Настройки
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-DB_PATH = "/tmp/medical_bot.db"
+API_KEY = os.environ.get("GEMINI_API_KEY")
+# База данных теперь хранится в надежном месте Railway (или в /tmp для тестов)
+DB_PATH = "users_data.db" 
 
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+# Инициализация ИИ (с автоподбором модели)
+genai.configure(api_key=API_KEY)
+def get_model():
+    models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+    name = 'models/gemini-1.5-flash' if 'models/gemini-1.5-flash' in models else models[0]
+    return genai.GenerativeModel(name)
 
-# Функции базы данных
-def get_user_record(uid):
+model = get_model()
+
+# --- ЛОГИКА ИЗОЛЯЦИИ ДАННЫХ ---
+
+def init_db():
     conn = sqlite3.connect(DB_PATH)
-    res = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    # Создаем таблицу, где первичный ключ - это ID пользователя в Телеграм
+    conn.execute('''CREATE TABLE IF NOT EXISTS users 
+                    (user_id INTEGER PRIMARY KEY, info TEXT)''')
     conn.close()
-    return res
+
+def get_user_info(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    res = conn.execute("SELECT info FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return res[0] if res else None
+
+def save_user_info(user_id, text):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO users (user_id, info) VALUES (?, ?)", (user_id, text))
+    conn.commit()
+    conn.close()
+
+# --- ОБРАБОТКА СООБЩЕНИЙ ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    user_id = update.effective_user.id  # Уникальный ID каждого человека
     user_text = update.message.text
-    user_data = get_user_record(uid)
-
-    # Формируем СТРОГУЮ инструкцию для ИИ
-    if not user_data:
-        # Если анкеты нет — режим сбора данных
+    
+    # Достаем данные ТОЛЬКО этого пользователя
+    current_profile = get_user_info(user_id)
+    
+    # Инструкция для ИИ
+    if not current_profile:
         system_instruction = (
-            "Ты — медицинский ассистент. У тебя НЕТ данных об этом пользователе. "
-            "ТВОЯ ЗАДАЧА: Провести опрос. Не отправляй пользователя к ссылкам или в личный кабинет. "
-            "Спрашивай по одному пункту за раз: сначала пол и возраст, потом рост и вес, потом жалобы. "
-            "Если пользователь просто поздоровался или сказал 'готов', начни опрос с первого вопроса."
+            "Ты — медицинский ассистент. Это НОВЫЙ пользователь. "
+            "Начни опрос вежливо: спроси пол, возраст и рост. "
+            "ЗАПРЕЩЕНО говорить про личные кабинеты. Ты сам проводишь опрос прямо здесь."
         )
     else:
-        # Если анкета есть — режим консультации
         system_instruction = (
-            f"Ты — медицинский ассистент. ДАННЫЕ ПАЦИЕНТА: {user_data}. "
-            "Используй эти данные в ответах. Если пользователь хочет что-то изменить, обнови информацию."
+            f"Ты — медицинский ассистент. ДАННЫЕ ЭТОГО ПАЦИЕНТА: {current_profile}. "
+            "Отвечай на вопросы, используя этот контекст. Если он сообщает новые данные о здоровье — запомни их."
         )
 
-    prompt = f"{system_instruction}\n\nПользователь пишет: {user_text}"
-
+    await update.message.reply_chat_action(ChatAction.TYPING)
+    
     try:
-        response = model.generate_content(prompt)
-        await update.message.reply_text(response.text)
+        response = model.generate_content(f"{system_instruction}\n\nСообщение пользователя: {user_text}")
+        response_text = response.text
         
-        # ЛОГИКА СОХРАНЕНИЯ (упрощенно)
-        # Если ИИ в ответе подтвердил, что данные получены, можно добавить код записи в БД здесь
-        # Но для начала достаточно, чтобы он просто начал спрашивать.
+        # Если ИИ в ответе зафиксировал данные (например, после опроса), 
+        # мы можем обновлять профиль. Для простоты пока просто даем ИИ вести диалог.
+        # В идеале: если в ответе есть ключевые слова, сохраняем info.
+        
+        await update.message.reply_text(response_text)
+        
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
 
 def main():
-    # Создаем БД
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, info TEXT)")
-    conn.close()
-
+    init_db()
+    if not TOKEN: return
+    
+    # Railway запускает один экземпляр, который обслуживает ВСЕХ
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    
+    print("Бот запущен и разделяет пользователей...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
