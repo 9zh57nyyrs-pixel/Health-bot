@@ -1,616 +1,373 @@
 """
 Medical Consultation Telegram Bot
-Powered by Gemini 1.5 Flash | python-telegram-bot v20+
+Powered by Gemini | python-telegram-bot v20+
 """
 
 import asyncio
 import logging
 import os
 import re
+import sqlite3
 import sys
-from io import BytesIO
+from contextlib import contextmanager
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
-    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
 
-from database import (
-    init_db,
-    get_user_profile,
-    update_user_profile,
-    save_message,
-    get_history,
-    clear_history,
-)
-from gemini_client import GeminiClient
-
-# ─── Logging ─────────────────────────────────────────────────────────────────
-
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
-# ─── Conversation States ──────────────────────────────────────────────────────
+# ── States ────────────────────────────────────────────────────────────────────
+(STATE_MENU, STATE_ASK_GENDER, STATE_ASK_AGE, STATE_ASK_WEIGHT,
+ STATE_ASK_HEIGHT, STATE_ASK_CONDITIONS, STATE_CHAT, STATE_WAITING_PHOTO) = range(8)
 
-(
-    STATE_MENU,
-    STATE_ASK_GENDER,
-    STATE_ASK_AGE,
-    STATE_ASK_WEIGHT,
-    STATE_ASK_HEIGHT,
-    STATE_ASK_CONDITIONS,
-    STATE_CHAT,
-    STATE_WAITING_PHOTO,
-) = range(8)
-
-# ─── Keyboard Layouts ─────────────────────────────────────────────────────────
-
-MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["💊 Консультация", "📋 Моя медкарта"],
-        ["🔬 Анализы (фото)", "🆘 SOS"],
-    ],
+# ── Keyboards ─────────────────────────────────────────────────────────────────
+MAIN_MENU_KB = ReplyKeyboardMarkup(
+    [["💊 Консультация", "📋 Моя медкарта"], ["🔬 Анализы (фото)", "🆘 SOS"]],
     resize_keyboard=True,
-    one_time_keyboard=False,
 )
+GENDER_KB = ReplyKeyboardMarkup([["👨 Мужской", "👩 Женский"]], resize_keyboard=True, one_time_keyboard=True)
+SKIP_KB   = ReplyKeyboardMarkup([["⏭ Пропустить"]], resize_keyboard=True, one_time_keyboard=True)
 
-GENDER_KEYBOARD = ReplyKeyboardMarkup(
-    [["👨 Мужской", "👩 Женский"]],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
+# ── Database ──────────────────────────────────────────────────────────────────
+DB_PATH = os.environ.get("DATABASE_PATH", "medical_bot.db")
 
-SKIP_KEYBOARD = ReplyKeyboardMarkup(
-    [["⏭ Пропустить"]],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        yield conn
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"DB error: {e}")
+        raise
+    finally:
+        conn.close()
 
+def init_db():
+    with db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY, gender TEXT, age INTEGER,
+                weight INTEGER, height INTEGER, conditions TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                role TEXT, content TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+        """)
+    logger.info("DB initialized.")
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+def get_profile(uid):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        return dict(row) if row else {}
 
-def extract_number(text: str) -> int | None:
-    """Extract first integer from free-form text using regex."""
-    match = re.search(r"\b(\d{1,3})\b", text)
-    if match:
-        return int(match.group(1))
-    return None
+def set_profile(uid, **kwargs):
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+        if kwargs:
+            sets = ", ".join(f"{k}=?" for k in kwargs)
+            conn.execute(f"UPDATE users SET {sets} WHERE user_id=?", list(kwargs.values()) + [uid])
 
+def add_msg(uid, role, text):
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+        conn.execute("INSERT INTO messages (user_id,role,content) VALUES (?,?,?)", (uid, role, text))
 
-def format_profile(profile: dict) -> str:
-    """Format user profile for display."""
+def get_history(uid, limit=8):
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT role, content FROM (
+                SELECT role, content, created_at FROM messages
+                WHERE user_id=? ORDER BY created_at DESC LIMIT ?) ORDER BY created_at ASC
+        """, (uid, limit)).fetchall()
+        return [(r["role"], r["content"]) for r in rows]
+
+# ── Gemini ────────────────────────────────────────────────────────────────────
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
+
+SYSTEM_PROMPT = """Ты — элитный врач-терапевт с 30-летним опытом. Персональный медицинский ассистент в Telegram.
+ПРАВИЛА: учитывай профиль пациента; давай развёрнутые ответы; объясняй термины; перечисляй возможные причины симптомов; указывай когда нужна срочная помощь; при анализе фото расшифровывай показатели и нормы; форматируй с Markdown."""
+
+SAFETY = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+}
+MODELS = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-pro", "gemini-pro"]
+_model = None
+
+def init_gemini(api_key):
+    global _model
+    genai.configure(api_key=api_key)
+    try:
+        available = {m.name for m in genai.list_models()}
+        logger.info(f"Available models: {available}")
+    except Exception as e:
+        logger.warning(f"Cannot list models: {e}")
+        available = set()
+    chosen = next((n for n in MODELS if f"models/{n}" in available or n in available), MODELS[0])
+    logger.info(f"Using model: {chosen}")
+    _model = genai.GenerativeModel(
+        model_name=chosen, system_instruction=SYSTEM_PROMPT, safety_settings=SAFETY,
+        generation_config=genai.types.GenerationConfig(temperature=0.7, max_output_tokens=2048))
+    return chosen
+
+def _sync_ask(user_msg, history, ctx_str):
+    global _model
+    gh = [{"role": "model" if r == "assistant" else "user", "parts": [c]} for r, c in history[:-1]]
+    enriched = f"[Данные пациента: {ctx_str}]\n\nВопрос: {user_msg}"
+    for i, name in enumerate(MODELS):
+        try:
+            m = _model if i == 0 else genai.GenerativeModel(name, system_instruction=SYSTEM_PROMPT, safety_settings=SAFETY)
+            resp = m.start_chat(history=gh).send_message(enriched)
+            if i > 0:
+                _model = m
+            return resp.text
+        except Exception as e:
+            logger.error(f"Model {name} failed: {e}")
+    return "⚠️ ИИ временно недоступен. Попробуйте через минуту."
+
+def _sync_img(image_bytes, ctx_str, caption):
+    prompt = f"[Данные пациента: {ctx_str}]\nРасшифруй медицинский документ: определи тип, расшифруй показатели, укажи нормы, отметь отклонения, дай рекомендации.{chr(10) + 'Комментарий: ' + caption if caption else ''}"
+    mime = "image/png" if image_bytes[:4] == b'\x89PNG' else "image/jpeg"
+    for name in MODELS:
+        try:
+            return _model.generate_content([prompt, {"mime_type": mime, "data": image_bytes}]).text
+        except Exception as e:
+            logger.error(f"Image {name} failed: {e}")
+    return "⚠️ Не удалось проанализировать изображение."
+
+async def ask_gemini(msg, history, ctx): return await asyncio.to_thread(_sync_ask, msg, history, ctx)
+async def analyze_img(b, ctx, cap=""): return await asyncio.to_thread(_sync_img, b, ctx, cap)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def extract_num(text):
+    m = re.search(r"\b(\d{1,3})\b", text)
+    return int(m.group(1)) if m else None
+
+def patient_ctx(p):
+    parts = []
+    if p.get("gender"):     parts.append("Пол: " + ("мужской" if p["gender"] == "male" else "женский"))
+    if p.get("age"):        parts.append(f"Возраст: {p['age']} лет")
+    if p.get("weight"):     parts.append(f"Вес: {p['weight']} кг")
+    if p.get("height"):     parts.append(f"Рост: {p['height']} см")
+    if p.get("conditions"): parts.append(f"Заболевания: {p['conditions']}")
+    return "; ".join(parts) if parts else "Данные не указаны"
+
+def fmt_profile(p):
+    if not p or not p.get("age"): return "📋 *Медкарта пуста.* Используйте /start"
     lines = ["📋 *Ваша медицинская карта*\n"]
-    fields = {
-        "gender": ("Пол", lambda v: "Мужской" if v == "male" else "Женский"),
-        "age": ("Возраст", lambda v: f"{v} лет"),
-        "weight": ("Вес", lambda v: f"{v} кг"),
-        "height": ("Рост", lambda v: f"{v} см"),
-        "conditions": ("Хронические заболевания", lambda v: v or "Не указаны"),
-    }
-    any_data = False
-    for key, (label, formatter) in fields.items():
-        val = profile.get(key)
-        if val is not None and val != "":
-            lines.append(f"• *{label}:* {formatter(val)}")
-            any_data = True
-    if not any_data:
-        lines.append("_Профиль не заполнен. Используйте /start для опроса._")
+    if p.get("gender"):     lines.append("• *Пол:* " + ("Мужской" if p["gender"] == "male" else "Женский"))
+    if p.get("age"):        lines.append(f"• *Возраст:* {p['age']} лет")
+    if p.get("weight"):     lines.append(f"• *Вес:* {p['weight']} кг")
+    if p.get("height"):     lines.append(f"• *Рост:* {p['height']} см")
+    if p.get("conditions"): lines.append(f"• *Заболевания:* {p['conditions']}")
     return "\n".join(lines)
 
-
-def build_context_summary(profile: dict) -> str:
-    """Build a short patient context string for Gemini."""
-    parts = []
-    if profile.get("gender"):
-        parts.append("Пол: " + ("мужской" if profile["gender"] == "male" else "женский"))
-    if profile.get("age"):
-        parts.append(f"Возраст: {profile['age']} лет")
-    if profile.get("weight"):
-        parts.append(f"Вес: {profile['weight']} кг")
-    if profile.get("height"):
-        parts.append(f"Рост: {profile['height']} см")
-    if profile.get("conditions"):
-        parts.append(f"Хронические заболевания: {profile['conditions']}")
-    if not parts:
-        return "Данные пациента не предоставлены."
-    return "Данные пациента: " + "; ".join(parts) + "."
-
-
-# ─── Handler: /start ──────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    uid = user.id
-    logger.info(f"/start от пользователя {uid} (@{user.username})")
-
-    profile = get_user_profile(uid)
-    is_new = not profile or not profile.get("age")
-
-    if is_new:
-        await update.message.reply_text(
-            f"👋 Здравствуйте, *{user.first_name}*!\n\n"
-            "Я — ваш персональный медицинский ассистент на базе ИИ.\n"
-            "Чтобы давать точные рекомендации, мне нужно узнать о вас немного больше.\n\n"
-            "📝 Давайте заполним вашу медкарту. Это займёт ~1 минуту.\n\n"
-            "*Шаг 1/5:* Укажите ваш пол:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=GENDER_KEYBOARD,
-        )
-        return STATE_ASK_GENDER
-    else:
-        await update.message.reply_text(
-            f"👋 С возвращением, *{user.first_name}*!\n\n"
-            "Ваш профиль загружен. Чем могу помочь?\n"
-            "Задайте вопрос или выберите действие в меню ниже.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
-        return STATE_MENU
-
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Reset profile and start over."""
+# ── Handlers ──────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
-    update_user_profile(uid, gender=None, age=None, weight=None, height=None, conditions=None)
-    clear_history(uid)
-    logger.info(f"Пользователь {uid} сбросил профиль.")
-    await update.message.reply_text(
-        "🔄 Профиль сброшен. Начинаем заново!\n\nУкажите ваш пол:",
-        reply_markup=GENDER_KEYBOARD,
-    )
-    return STATE_ASK_GENDER
-
-
-# ─── Onboarding Handlers ──────────────────────────────────────────────────────
-
-async def handle_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.lower()
-    uid = update.effective_user.id
-
-    if "муж" in text:
-        gender = "male"
-    elif "жен" in text:
-        gender = "female"
-    else:
+    name = update.effective_user.first_name
+    p = get_profile(uid)
+    if not p or not p.get("age"):
         await update.message.reply_text(
-            "Пожалуйста, выберите пол с помощью кнопок ниже:",
-            reply_markup=GENDER_KEYBOARD,
-        )
+            f"👋 Здравствуйте, *{name}*!\n\nЯ — медицинский ассистент на базе ИИ.\nДавайте заполним медкарту. *Шаг 1/5:* Укажите пол:",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=GENDER_KB)
         return STATE_ASK_GENDER
+    await update.message.reply_text(f"👋 С возвращением, *{name}*!", parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU_KB)
+    return STATE_MENU
 
-    update_user_profile(uid, gender=gender)
-    logger.info(f"Пользователь {uid}: пол = {gender}")
-
-    await update.message.reply_text(
-        "✅ Отлично!\n\n*Шаг 2/5:* Сколько вам лет?\n_(можно написать, например: «мне 34 года»)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardRemove(),
-    )
+async def handle_gender(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    t = update.message.text.lower(); uid = update.effective_user.id
+    if "муж" in t: g = "male"
+    elif "жен" in t: g = "female"
+    else:
+        await update.message.reply_text("Выберите пол кнопками:", reply_markup=GENDER_KB)
+        return STATE_ASK_GENDER
+    set_profile(uid, gender=g)
+    await update.message.reply_text("✅ *Шаг 2/5:* Сколько лет? _(например: 34)_", parse_mode=ParseMode.MARKDOWN, reply_markup=ReplyKeyboardRemove())
     return STATE_ASK_AGE
 
-
-async def handle_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    uid = update.effective_user.id
-    age = extract_number(text)
-
-    if age is None or not (1 <= age <= 120):
-        await update.message.reply_text(
-            "⚠️ Не смог распознать возраст. Пожалуйста, напишите число, например: *34*",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+async def handle_age(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id; age = extract_num(update.message.text)
+    if not age or not (1 <= age <= 120):
+        await update.message.reply_text("⚠️ Напишите возраст числом, например *34*:", parse_mode=ParseMode.MARKDOWN)
         return STATE_ASK_AGE
-
-    update_user_profile(uid, age=age)
-    logger.info(f"Пользователь {uid}: возраст = {age}")
-
-    await update.message.reply_text(
-        f"✅ Принято: {age} лет.\n\n*Шаг 3/5:* Ваш вес?\n_(в килограммах, например: «70» или «вешу 85 кг»)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=SKIP_KEYBOARD,
-    )
+    set_profile(uid, age=age)
+    await update.message.reply_text(f"✅ {age} лет.\n\n*Шаг 3/5:* Вес в кг? _(например: 75)_", parse_mode=ParseMode.MARKDOWN, reply_markup=SKIP_KB)
     return STATE_ASK_WEIGHT
 
-
-async def handle_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    uid = update.effective_user.id
-
-    if "пропуст" in text.lower() or text.strip() == "⏭ Пропустить":
-        weight = None
+async def handle_weight(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id; t = update.message.text
+    if "пропуст" in t.lower() or "⏭" in t: w = None
     else:
-        weight = extract_number(text)
-        if weight is None or not (20 <= weight <= 300):
-            await update.message.reply_text(
-                "⚠️ Не смог распознать вес. Напишите число (например: *75*) или нажмите «Пропустить».",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=SKIP_KEYBOARD,
-            )
+        w = extract_num(t)
+        if not w or not (20 <= w <= 300):
+            await update.message.reply_text("⚠️ Напишите вес числом или «Пропустить»:", reply_markup=SKIP_KB)
             return STATE_ASK_WEIGHT
-
-    if weight:
-        update_user_profile(uid, weight=weight)
-    logger.info(f"Пользователь {uid}: вес = {weight}")
-
-    await update.message.reply_text(
-        f"✅ {'Принято: ' + str(weight) + ' кг.' if weight else 'Пропущено.'}\n\n"
-        "*Шаг 4/5:* Ваш рост?\n_(в сантиметрах, например: «172»)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=SKIP_KEYBOARD,
-    )
+    if w: set_profile(uid, weight=w)
+    await update.message.reply_text(f"✅ {'Принято.' if w else 'Пропущено.'}\n\n*Шаг 4/5:* Рост в см? _(например: 172)_", parse_mode=ParseMode.MARKDOWN, reply_markup=SKIP_KB)
     return STATE_ASK_HEIGHT
 
-
-async def handle_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    uid = update.effective_user.id
-
-    if "пропуст" in text.lower() or text.strip() == "⏭ Пропустить":
-        height = None
+async def handle_height(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id; t = update.message.text
+    if "пропуст" in t.lower() or "⏭" in t: h = None
     else:
-        height = extract_number(text)
-        if height is None or not (50 <= height <= 250):
-            await update.message.reply_text(
-                "⚠️ Не смог распознать рост. Напишите число (например: *172*) или нажмите «Пропустить».",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=SKIP_KEYBOARD,
-            )
+        h = extract_num(t)
+        if not h or not (50 <= h <= 250):
+            await update.message.reply_text("⚠️ Напишите рост числом или «Пропустить»:", reply_markup=SKIP_KB)
             return STATE_ASK_HEIGHT
-
-    if height:
-        update_user_profile(uid, height=height)
-    logger.info(f"Пользователь {uid}: рост = {height}")
-
-    await update.message.reply_text(
-        f"✅ {'Принято: ' + str(height) + ' см.' if height else 'Пропущено.'}\n\n"
-        "*Шаг 5/5 (последний):* Есть ли у вас хронические заболевания, аллергии или важные особенности здоровья?\n\n"
-        "_Например: «диабет 2 типа, аллергия на пенициллин» или нажмите «Пропустить»_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=SKIP_KEYBOARD,
-    )
+    if h: set_profile(uid, height=h)
+    await update.message.reply_text(f"✅ {'Принято.' if h else 'Пропущено.'}\n\n*Шаг 5/5:* Хронические заболевания, аллергии?\n_Например: диабет 2 типа_", parse_mode=ParseMode.MARKDOWN, reply_markup=SKIP_KB)
     return STATE_ASK_CONDITIONS
 
-
-async def handle_conditions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    uid = update.effective_user.id
-
-    if "пропуст" in text.lower() or text == "⏭ Пропустить":
-        conditions = None
-    else:
-        conditions = text
-
-    if conditions:
-        update_user_profile(uid, conditions=conditions)
-    logger.info(f"Пользователь {uid}: заболевания = {conditions}")
-
+async def handle_conditions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id; t = update.message.text.strip()
+    if "пропуст" not in t.lower() and "⏭" not in t: set_profile(uid, conditions=t)
     await update.message.reply_text(
-        "🎉 *Отлично! Ваша медкарта заполнена.*\n\n"
-        "Теперь я буду учитывать ваши данные при каждой консультации.\n"
-        "Задайте любой медицинский вопрос или выберите действие в меню ниже.\n\n"
-        "⚠️ _Напоминание: я — ИИ-ассистент. Мои ответы не заменяют визит к врачу._",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=MAIN_MENU_KEYBOARD,
-    )
+        "🎉 *Медкарта заполнена!*\n\nЗадайте любой медицинский вопрос.\n\n⚠️ _Ответы информационны и не заменяют врача._",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU_KB)
     return STATE_MENU
 
-
-# ─── Main Menu Handler ────────────────────────────────────────────────────────
-
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    uid = update.effective_user.id
-
-    if "медкарт" in text.lower():
-        profile = get_user_profile(uid)
-        await update.message.reply_text(
-            format_profile(profile or {}),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    t = update.message.text; uid = update.effective_user.id
+    if "медкарт" in t.lower():
+        await update.message.reply_text(fmt_profile(get_profile(uid)), parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU_KB)
         return STATE_MENU
-
-    elif "анализ" in text.lower():
-        await update.message.reply_text(
-            "🔬 *Режим анализа медицинских документов*\n\n"
-            "Пришлите фото анализов, снимка или медицинского документа — "
-            "я постараюсь его расшифровать и объяснить результаты.\n\n"
-            "_Поддерживаются фото лабораторных анализов, ЭКГ, рентгенов и т.д._",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=ReplyKeyboardMarkup(
-                [["🔙 Главное меню"]],
-                resize_keyboard=True,
-            ),
-        )
+    if "анализ" in t.lower():
+        await update.message.reply_text("🔬 Пришлите фото медицинского документа:", reply_markup=ReplyKeyboardMarkup([["🔙 Меню"]], resize_keyboard=True))
         return STATE_WAITING_PHOTO
-
-    elif "sos" in text.lower():
-        await update.message.reply_text(
-            "🆘 *ЭКСТРЕННАЯ ПОМОЩЬ*\n\n"
-            "📞 *Скорая помощь:* 103 (Россия)\n"
-            "📞 *Единый экстренный:* 112\n"
-            "📞 *Телефон доверия:* 8-800-2000-122\n\n"
-            "━━━━━━━━━━━━━━━\n"
-            "Если вы или кто-то рядом в опасности — *немедленно звоните 112*.\n\n"
-            "Опишите вашу ситуацию, и я дам первичные рекомендации до приезда врача:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+    if "sos" in t.lower():
+        await update.message.reply_text("🆘 *ЭКСТРЕННАЯ ПОМОЩЬ*\n\n📞 Скорая: *103*\n📞 Единый: *112*\n\nОпишите ситуацию:", parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU_KB)
         return STATE_CHAT
-
-    elif "консультац" in text.lower():
-        await update.message.reply_text(
-            "💊 *Режим консультации*\n\n"
-            "Опишите ваши симптомы или задайте медицинский вопрос.\n"
-            "Я учту ваши данные из медкарты.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+    if "консультац" in t.lower():
+        await update.message.reply_text("💊 Задайте ваш вопрос:", reply_markup=MAIN_MENU_KB)
         return STATE_CHAT
-
-    elif "меню" in text.lower() or text == "🔙 Главное меню":
-        await update.message.reply_text(
-            "Главное меню:",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+    if "меню" in t.lower() or "🔙" in t:
+        await update.message.reply_text("Главное меню:", reply_markup=MAIN_MENU_KB)
         return STATE_MENU
+    return await handle_chat(update, ctx)
 
-    else:
-        # Any other text → treat as a consultation question
-        return await handle_chat(update, context)
-
-
-# ─── Chat Handler (AI Consultation) ──────────────────────────────────────────
-
-async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    uid = update.effective_user.id
-    user_text = update.message.text.strip()
-
-    # Проверка: если профиль не заполнен — проактивно предлагаем
-    profile = get_user_profile(uid)
-    if not profile or not profile.get("age"):
-        await update.message.reply_text(
-            "⚠️ Я вижу, что вы ещё не заполнили медкарту.\n"
-            "Для более точных рекомендаций давайте сначала пройдём короткий опрос.\n\n"
-            "Укажите ваш пол:",
-            reply_markup=GENDER_KEYBOARD,
-        )
+async def handle_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id; text = update.message.text.strip()
+    p = get_profile(uid)
+    if not p or not p.get("age"):
+        await update.message.reply_text("⚠️ Сначала заполните медкарту. Укажите пол:", reply_markup=GENDER_KB)
         return STATE_ASK_GENDER
-
     await update.message.chat.send_action(ChatAction.TYPING)
-
-    # Сохраняем сообщение пользователя
-    save_message(uid, "user", user_text)
-
-    # Получаем историю
-    history = get_history(uid, limit=10)
-    patient_context = build_context_summary(profile)
-
-    gemini: GeminiClient = context.bot_data["gemini"]
-
+    add_msg(uid, "user", text)
     try:
-        response_text = await gemini.chat(
-            user_message=user_text,
-            history=history,
-            patient_context=patient_context,
-        )
+        reply = await ask_gemini(text, get_history(uid), patient_ctx(p))
     except Exception as e:
-        logger.error(f"Ошибка Gemini для пользователя {uid}: {e}", exc_info=True)
-        response_text = (
-            "⚠️ Произошла ошибка при обращении к ИИ-сервису. "
-            "Попробуйте повторить через несколько секунд или перезапустите бота командой /start."
-        )
-
-    # Сохраняем ответ
-    save_message(uid, "assistant", response_text)
-
-    await update.message.reply_text(
-        response_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=MAIN_MENU_KEYBOARD,
-    )
+        logger.error(f"Gemini error: {e}", exc_info=True)
+        reply = "⚠️ Ошибка ИИ. Попробуйте ещё раз."
+    add_msg(uid, "assistant", reply)
+    await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU_KB)
     return STATE_MENU
 
-
-# ─── Photo Handler (Multimodal Analysis) ─────────────────────────────────────
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
-
-    if update.message.text and ("меню" in update.message.text.lower() or "🔙" in update.message.text):
-        await update.message.reply_text("Возвращаемся в главное меню.", reply_markup=MAIN_MENU_KEYBOARD)
-        return STATE_MENU
-
-    photo = update.message.photo
-    document = update.message.document
-
-    if not photo and not document:
-        await update.message.reply_text(
-            "Пожалуйста, пришлите *фото* медицинского документа или анализа.\n"
-            "Или нажмите «🔙 Главное меню».",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    if update.message.text:
+        t = update.message.text
+        if "меню" in t.lower() or "🔙" in t:
+            await update.message.reply_text("Главное меню:", reply_markup=MAIN_MENU_KB)
+            return STATE_MENU
+        await update.message.reply_text("Пришлите фото анализа или нажмите «🔙 Меню».")
         return STATE_WAITING_PHOTO
-
-    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
-    await update.message.reply_text("🔍 Анализирую изображение, подождите...")
-
+    photo = update.message.photo; doc = update.message.document
+    if not photo and not doc:
+        await update.message.reply_text("Пожалуйста, пришлите *фото*.", parse_mode=ParseMode.MARKDOWN)
+        return STATE_WAITING_PHOTO
+    await update.message.reply_text("🔍 Анализирую...")
+    await update.message.chat.send_action(ChatAction.TYPING)
     try:
-        # Получаем файл
-        if photo:
-            file_obj = await update.message.photo[-1].get_file()
-        else:
-            file_obj = await document.get_file()
-
-        file_bytes = await file_obj.download_as_bytearray()
-        image_data = bytes(file_bytes)
-
-        # Получаем профиль
-        profile = get_user_profile(uid) or {}
-        patient_context = build_context_summary(profile)
-        caption = update.message.caption or ""
-
-        gemini: GeminiClient = context.bot_data["gemini"]
-
-        await update.message.chat.send_action(ChatAction.TYPING)
-
-        response_text = await gemini.analyze_image(
-            image_bytes=image_data,
-            patient_context=patient_context,
-            caption=caption,
-        )
-
-        save_message(uid, "user", f"[Фото анализа отправлено]{'. Комментарий: ' + caption if caption else ''}")
-        save_message(uid, "assistant", response_text)
-
-        await update.message.reply_text(
-            response_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
-        return STATE_MENU
-
+        f = await (update.message.photo[-1] if photo else doc).get_file()
+        img = bytes(await f.download_as_bytearray())
+        p = get_profile(uid); cap = update.message.caption or ""
+        reply = await analyze_img(img, patient_ctx(p), cap)
+        add_msg(uid, "user", f"[Фото]{' ' + cap if cap else ''}")
+        add_msg(uid, "assistant", reply)
+        await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_MENU_KB)
     except Exception as e:
-        logger.error(f"Ошибка анализа фото для пользователя {uid}: {e}", exc_info=True)
-        await update.message.reply_text(
-            "⚠️ Не удалось обработать изображение. Попробуйте прислать другое фото или повторите позже.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
-        return STATE_MENU
-
-
-# ─── Fallback & Error Handlers ────────────────────────────────────────────────
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "Действие отменено. Вы в главном меню.",
-        reply_markup=MAIN_MENU_KEYBOARD,
-    )
+        logger.error(f"Photo error: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Не удалось обработать фото.", reply_markup=MAIN_MENU_KB)
     return STATE_MENU
 
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Отменено.", reply_markup=MAIN_MENU_KB)
+    return STATE_MENU
 
-async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    history = get_history(uid, limit=5)
-    if not history:
-        await update.message.reply_text("История консультаций пуста.")
-        return
-    lines = ["📜 *Последние 5 сообщений:*\n"]
-    for role, content, ts in history:
-        icon = "👤" if role == "user" else "🤖"
-        lines.append(f"{icon} _{ts}_\n{content[:200]}{'...' if len(content) > 200 else ''}\n")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    set_profile(update.effective_user.id, gender=None, age=None, weight=None, height=None, conditions=None)
+    await update.message.reply_text("🔄 Профиль сброшен. Укажите пол:", reply_markup=GENDER_KB)
+    return STATE_ASK_GENDER
 
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Глобальная ошибка бота:", exc_info=context.error)
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Глобальная ошибка:", exc_info=ctx.error)
     if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "⚠️ Произошла внутренняя ошибка. Попробуйте /start для перезапуска."
-            )
-        except Exception:
-            pass
+        try: await update.effective_message.reply_text("⚠️ Ошибка. Попробуйте /start")
+        except Exception: pass
 
-
-# ─── Application Bootstrap ────────────────────────────────────────────────────
-
-def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN") or ""
+    gemini_key = os.environ.get("GEMINI_API_KEY") or ""
     if not token:
-        logger.critical("TELEGRAM_BOT_TOKEN не задан в переменных окружения!")
+        logger.critical("❌ TELEGRAM_BOT_TOKEN не задан!")
         sys.exit(1)
     if not gemini_key:
-        logger.critical("GEMINI_API_KEY не задан в переменных окружения!")
+        logger.critical("❌ GEMINI_API_KEY не задан!")
         sys.exit(1)
 
-    # Инициализация БД
+    logger.info("Инициализация DB...")
     init_db()
-    logger.info("База данных инициализирована.")
+    logger.info("Инициализация Gemini...")
+    model_name = init_gemini(gemini_key)
+    logger.info(f"Модель: {model_name}")
 
-    # Инициализация Gemini
-    gemini_client = GeminiClient(api_key=gemini_key)
-    logger.info(f"Gemini клиент создан. Модель: {gemini_client.model_name}")
-
-    # Создание приложения
     app = Application.builder().token(token).build()
-    app.bot_data["gemini"] = gemini_client
-
-    # ── Conversation Handler ──────────────────────────────────────────────────
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", cmd_start),
-        ],
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
         states={
-            STATE_ASK_GENDER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_gender),
-            ],
-            STATE_ASK_AGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_age),
-            ],
-            STATE_ASK_WEIGHT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_weight),
-            ],
-            STATE_ASK_HEIGHT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_height),
-            ],
-            STATE_ASK_CONDITIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conditions),
-            ],
-            STATE_MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu),
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo),
-            ],
-            STATE_CHAT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat),
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo),
-            ],
-            STATE_WAITING_PHOTO: [
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_photo),
-            ],
+            STATE_ASK_GENDER:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_gender)],
+            STATE_ASK_AGE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_age)],
+            STATE_ASK_WEIGHT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_weight)],
+            STATE_ASK_HEIGHT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_height)],
+            STATE_ASK_CONDITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conditions)],
+            STATE_MENU:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu),
+                          MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)],
+            STATE_CHAT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat),
+                          MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)],
+            STATE_WAITING_PHOTO: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo),
+                                   MessageHandler(filters.TEXT & ~filters.COMMAND, handle_photo)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cmd_cancel),
-            CommandHandler("start", cmd_start),
-        ],
+        fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("start", cmd_start)],
         allow_reentry=True,
-        name="medical_consultation",
-        persistent=False,
     )
-
-    app.add_handler(conv_handler)
+    app.add_handler(conv)
     app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("history", cmd_history))
     app.add_error_handler(error_handler)
-
-    logger.info("🤖 Бот запускается...")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
-
+    logger.info("✅ Бот запущен!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
