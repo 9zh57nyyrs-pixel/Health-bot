@@ -1,46 +1,39 @@
 import google.generativeai as genai
 import os
+from google.generativeai.types import RequestOptions
 
-# Подключаем ключ
+# Настройка ключа
 api_key = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=api_key)
 
 class GeminiClient:
     @staticmethod
     async def ask(prompt, user_id, photo_bytes=None):
-        # Список моделей от самой новой к самой стабильной
-        model_names = [
-            'gemini-1.5-flash-latest', 
-            'gemini-1.5-flash', 
-            'gemini-pro'
-        ]
+        # Используем простую версию имени модели без лишних префиксов
+        model_name = 'models/gemini-1.5-flash'
         
-        last_error = ""
-        
-        for name in model_names:
-            try:
-                model = genai.GenerativeModel(model_name=name)
-                
-                if photo_bytes:
-                    # Современный формат передачи медиа для Gemini 1.5
-                    contents = [
-                        {
-                            "role": "user",
-                            "parts": [
-                                {"text": "Ты медицинский эксперт. Проанализируй фото анализов, выдели отклонения и дай советы."},
-                                {"inline_data": {"mime_type": "image/jpeg", "data": photo_bytes}}
-                            ]
-                        }
-                    ]
-                    response = model.generate_content(contents)
-                else:
-                    # Обычный текст
-                    response = model.generate_content(prompt)
-                
-                return response.text
-                
-            except Exception as e:
-                last_error = str(e)
-                continue # Пробуем следующую модель из списка
-        
-        return f"Ошибка перебора моделей: {last_error}. Проверьте, активен ли Gemini API в Google AI Studio."
+        try:
+            # Принудительно задаем версию API v1 (вместо v1beta)
+            model = genai.GenerativeModel(model_name=model_name)
+            options = RequestOptions(api_version='v1')
+            
+            if photo_bytes:
+                contents = [
+                    "Ты врач-ассистент. Проанализируй анализы на фото.",
+                    {"mime_type": "image/jpeg", "data": photo_bytes}
+                ]
+                # Передаем опции с версией API
+                response = model.generate_content(contents, request_options=options)
+            else:
+                response = model.generate_content(prompt, request_options=options)
+            
+            return response.text
+            
+        except Exception as e:
+            # Если v1 не сработал, это 100% проблема региона или ключа
+            error_msg = str(e)
+            if "404" in error_msg:
+                return ("❌ Ошибка 404: Google API не видит модель в этом регионе.\n"
+                        "Попробуйте зайти в Google AI Studio и создать НОВЫЙ ключ, "
+                        "предварительно убедившись, что API Gemini включен.")
+            return f"Ошибка AI: {error_msg}"
