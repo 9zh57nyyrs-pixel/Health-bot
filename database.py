@@ -7,41 +7,30 @@ DB_PATH = 'health_bot.db'
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Таблица профиля пациента
     cursor.execute('''CREATE TABLE IF NOT EXISTS user_profiles 
-                      (user_id INTEGER PRIMARY KEY, 
-                       age INTEGER, gender TEXT, weight REAL, 
-                       height REAL, chronic_diseases TEXT, 
-                       medications TEXT, activity_level TEXT,
-                       created_at DATETIME)''')
-    # Таблица для анализов и замеров
-    cursor.execute('''CREATE TABLE IF NOT EXISTS health_history 
-                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                       user_id INTEGER, 
-                       event_type TEXT, 
-                       data TEXT, 
-                       timestamp DATETIME)''')
+                      (user_id INTEGER PRIMARY KEY, age INTEGER, gender TEXT, 
+                       weight REAL, height REAL, chronic_diseases TEXT, created_at DATETIME)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, user_id INTEGER, action TEXT, time DATETIME)''')
     conn.commit()
     conn.close()
 
-def update_profile(user_id, **kwargs):
+def save_user(user_id, **kwargs):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM user_profiles WHERE user_id = ?", (user_id,))
     if not cursor.fetchone():
-        cursor.execute("INSERT INTO user_profiles (user_id, created_at) VALUES (?, ?)", 
-                       (user_id, datetime.now()))
+        cursor.execute("INSERT INTO user_profiles (user_id, created_at) VALUES (?, ?)", (user_id, datetime.now()))
     
     for key, value in kwargs.items():
         cursor.execute(f"UPDATE user_profiles SET {key} = ? WHERE user_id = ?", (value, user_id))
     conn.commit()
     conn.close()
 
-def get_profile(user_id):
+def get_user(user_id):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
+    res = cursor.fetchone()
     conn.close()
-    return dict(row) if row else None
+    return dict(res) if res else None
