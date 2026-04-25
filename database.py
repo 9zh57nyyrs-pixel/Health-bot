@@ -16,20 +16,8 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            age INTEGER,
-            gender TEXT,
+            profile TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS health_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            record_type TEXT,
-            value TEXT,
-            notes TEXT,
-            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     """)
     c.execute("""
@@ -57,36 +45,24 @@ def save_user(user_id, username, first_name):
     conn.close()
 
 
-def save_health_record(user_id, record_type, value, notes=""):
+def get_user(user_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO health_records (user_id, record_type, value, notes) VALUES (?, ?, ?, ?)",
-        (user_id, record_type, value, notes)
-    )
+    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+
+def update_profile(user_id, profile_text):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE users SET profile=? WHERE user_id=?", (profile_text, user_id))
     conn.commit()
     conn.close()
 
 
-def get_health_records(user_id, record_type=None, limit=10):
-    conn = get_connection()
-    c = conn.cursor()
-    if record_type:
-        c.execute(
-            "SELECT * FROM health_records WHERE user_id=? AND record_type=? ORDER BY recorded_at DESC LIMIT ?",
-            (user_id, record_type, limit)
-        )
-    else:
-        c.execute(
-            "SELECT * FROM health_records WHERE user_id=? ORDER BY recorded_at DESC LIMIT ?",
-            (user_id, limit)
-        )
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def save_conversation(user_id, role, content):
+def save_message(user_id, role, content):
     conn = get_connection()
     c = conn.cursor()
     c.execute(
@@ -97,11 +73,11 @@ def save_conversation(user_id, role, content):
     conn.close()
 
 
-def get_conversation_history(user_id, limit=20):
+def get_history(user_id, limit=40):
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        "SELECT role, content FROM conversations WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+        "SELECT role, content, created_at FROM conversations WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
         (user_id, limit)
     )
     rows = c.fetchall()
@@ -109,21 +85,21 @@ def get_conversation_history(user_id, limit=20):
     return list(reversed(rows))
 
 
-def get_user_info(user_id):
+def get_full_history(user_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    user = c.fetchone()
+    c.execute(
+        "SELECT role, content, created_at FROM conversations WHERE user_id=? ORDER BY created_at ASC",
+        (user_id,)
+    )
+    rows = c.fetchall()
     conn.close()
-    return user
+    return rows
 
 
-def update_user_info(user_id, age=None, gender=None):
+def clear_history(user_id):
     conn = get_connection()
     c = conn.cursor()
-    if age is not None:
-        c.execute("UPDATE users SET age=? WHERE user_id=?", (age, user_id))
-    if gender is not None:
-        c.execute("UPDATE users SET gender=? WHERE user_id=?", (gender, user_id))
+    c.execute("DELETE FROM conversations WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
