@@ -6,38 +6,40 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 class GeminiClient:
     @staticmethod
-    async def ask(prompt, user_id, photo_bytes=None):
-        # 1. Загружаем данные пользователя из базы
-        user_data = database.get_user(user_id)
+    async def get_response(user_id, text_input=None, photo_bytes=None):
+        profile, metrics = database.get_full_context(user_id)
         
-        # 2. Формируем контекст для ИИ
-        if user_data:
-            profile_info = f"Пациент: {user_data['age']} лет, пол {user_data['gender']}, вес {user_data['weight']} кг."
+        # Формируем клиническую картину для ИИ
+        context = "КЛИНИЧЕСКАЯ КАРТИНА ПАЦИЕНТА:\n"
+        if profile:
+            context += f"- Возраст: {profile['age']}, Пол: {profile['gender']}, Вес: {profile['weight']}\n"
+            context += f"- Хронические заболевания: {profile['chronic_diseases'] or 'Не указано'}\n"
         else:
-            profile_info = "Профиль пациента пуст. Твоя задача — собрать данные (возраст, пол, вес, жалобы)."
-
-        system_instruction = f"""
-        Ты — элитный врач-терапевт. Твоя задача — вести пациента.
-        {profile_info}
+            context += "- ДАННЫЕ ОТСУТСТВУЮТ. ТРЕБУЕТСЯ АНКЕТИРОВАНИЕ.\n"
         
-        ПРАВИЛА ПОВЕДЕНИЯ:
-        - Если данных профиля нет, начни опрос. Не спрашивай всё сразу, задавай по 1-2 вопроса.
-        - Если прислали фото анализов — проведи детальный разбор.
-        - Будь проактивен: сам предлагай, какие анализы сдать исходя из возраста.
-        - Всегда добавляй дисклеймер: 'Я — ИИ, проконсультируйтесь с врачом'.
+        system_prompt = f"""
+        Ты — ведущий врач-терапевт с 20-летним стажем. Твоя цель — превентивное здоровье.
+        {context}
+        
+        ТВОИ ЗАДАЧИ:
+        1. ИНИЦИАТИВА: Если в профиле не хватает данных (возраст, вес, пол), ты обязан ПРЕРВАТЬ любой разговор и вежливо запросить эти данные по одному.
+        2. АНАЛИЗ ФОТО: Если прислали анализы, разбери каждый пункт, сравни с нормами и выдели критические отклонения.
+        3. РЕКОМЕНДАЦИИ: На основе возраста (например, если >40 лет), сам предлагай ежегодный чекап (УЗИ, ПСА, Маммография).
+        4. СТИЛЬ: Профессиональный, но человечный. Избегай воды.
+        
+        ВНИМАНИЕ: Если пациент жалуется на симптомы 'красных флагов' (боль за грудиной, онемение лица), немедленно требуй вызвать скорую.
         """
 
         try:
-            model = genai.GenerativeModel(model_name='gemini-1.5-flash', system_instruction=system_instruction)
+            model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_prompt)
             
             if photo_bytes:
-                response = model.generate_content([
-                    {"mime_type": "image/jpeg", "data": photo_bytes},
-                    "Разбери анализы и сравни с нормой."
-                ])
+                content = [{"mime_type": "image/jpeg", "data": photo_bytes}, 
+                           text_input if text_input else "Проанализируй документ."]
+                response = model.generate_content(content)
             else:
-                response = model.generate_content(prompt)
+                response = model.generate_content(text_input)
             
             return response.text
         except Exception as e:
-            return f"Ошибка ИИ: {str(e)}"
+            return f"⚠️ Ошибка медицинского модуля: {str(e)}"
