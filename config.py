@@ -1,4 +1,3 @@
-# config.py — совместимость со старым кодом
 import os
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
