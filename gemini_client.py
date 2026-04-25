@@ -1,46 +1,37 @@
 import google.generativeai as genai
 import os
+import database
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-# ВАЖНО: Это "личность" вашего бота. 
-SYSTEM_INSTRUCTION = """
-Ты — специализированный ИИ-врач, персональный ассистент пользователя в Telegram. 
-Твои задачи:
-1. Анализ медицинских анализов по фото: интерпретируй показатели, указывай на отклонения от нормы.
-2. Мониторинг здоровья: помогай фиксировать вес, питание и активность.
-3. План обследований: на основе возраста и пола пользователя предлагай чекапы.
-4. Оценка здоровья: оценивай состояние пользователя по шкале от 1 до 10.
-5. Безопасность: Если пользователь пишет о критических симптомах (острая боль в груди, удушье), первым делом рекомендуй вызвать скорую помощь (103/112).
-
-Твой стиль: профессиональный, поддерживающий, лаконичный. 
-ВАЖНО: Всегда добавляй дисклеймер, что ты ИИ, а не живой врач, и твои советы носят информационный характер.
-"""
 
 class GeminiClient:
     @staticmethod
     async def ask(prompt, user_id, photo_bytes=None):
+        user_data = database.get_user(user_id)
+        
+        # Контекст о пользователе для ИИ
+        context = "Данные пользователя: Неизвестны. СНАЧАЛА СОБЕРИ АНКЕТУ."
+        if user_data:
+            context = f"Данные пользователя: Возраст {user_data['age']}, Пол {user_data['gender']}, Вес {user_data['weight']}кг."
+
+        system_instruction = f"""
+        Ты — элитный врач-терапевт. Твоя цель: превентивная медицина.
+        {context}
+        
+        ТВОИ ПРАВИЛА:
+        1. ИНИЦИАТИВА: Если в данных профиля пусто, ты обязан вежливо, по очереди собрать: Возраст, Пол, Текущие жалобы, Хронические болезни.
+        2. АНАЛИЗ: Если прислали фото, делай глубокий разбор.
+        3. ПАМЯТЬ: Ссылайся на предыдущие данные (например: 'Твой вес снизился на 2кг, это хорошо').
+        4. КРИТИКА: Будь строг, если пользователь нарушает режим, но поддерживай.
+        """
+
+        model = genai.GenerativeModel(model_name='gemini-1.5-flash', system_instruction=system_instruction)
+        
         try:
-            # Находим доступную модель
-            available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            target_model = 'models/gemini-1.5-flash' if 'models/gemini-1.5-flash' in available_models else available_models[0]
-
-            # Инициализируем модель с СИСТЕМНОЙ ИНСТРУКЦИЕЙ
-            model = genai.GenerativeModel(
-                model_name=target_model,
-                system_instruction=SYSTEM_INSTRUCTION
-            )
-            
             if photo_bytes:
-                content = [
-                    {"mime_type": "image/jpeg", "data": photo_bytes},
-                    "Проанализируй эти анализы как врач-ассистент."
-                ]
-                response = model.generate_content(content)
+                res = model.generate_content([{"mime_type": "image/jpeg", "data": photo_bytes}, "Разбери анализы"])
             else:
-                response = model.generate_content(prompt if prompt else "Привет!")
-            
-            return response.text
-
+                res = model.generate_content(prompt)
+            return res.text
         except Exception as e:
-            return f"Ошибка AI: {str(e)}"
+            return f"Ошибка: {str(e)}"
