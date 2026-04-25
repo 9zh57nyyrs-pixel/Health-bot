@@ -66,6 +66,21 @@ async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user_context = get_context(uid)
     
+    # Промпт, который заставляет ИИ проводить опрос
+    if "Данные анкеты отсутствуют" in user_context:
+        instruction = (
+            "Ты — медицинский ассистент. Данных о пациенте нет. "
+            "ТВОЯ ЗАДАЧА: Проведи опрос прямо сейчас. Спроси пол и возраст. "
+            "Не пиши общих фраз, не предлагай искать анкету. Просто задай вопрос."
+        )
+    else:
+        instruction = f"Ты — мед-ассистент. Контекст пациента: {user_context}"
+
+    content = [
+        f"УСТАНОВКА: {instruction}\n",
+        f"СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ: {update.message.text or update.message.caption or 'Проанализируй'}"
+    ]
+    
     # ЖЕСТКАЯ ИНСТРУКЦИЯ ДЛЯ ИИ
     if user_context == "ДАННЫЕ АНКЕТЫ ОТСУТСТВУЮТ.":
         instruction = (
@@ -97,7 +112,12 @@ async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i in range(0, len(text), 4000):
             await update.message.reply_text(text[i:i+4000])
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка ИИ: {str(e)}")
+        logger.error(f"Ошибка в handle_all: {e}")
+        # Если ошибка связана с длинным сообщением или Markdown, шлем чистый текст
+        try:
+            await update.message.reply_text(f"⚠️ Произошла ошибка ИИ. Попробуйте переформулировать запрос.")
+        except:
+            pass
 
 def main():
     conn = sqlite3.connect(DB_PATH)
