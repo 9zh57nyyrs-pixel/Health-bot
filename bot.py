@@ -1,33 +1,44 @@
 import os
 import sqlite3
+import logging
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.constants import ChatAction
 
-# Настройки
+# Настройка логов, чтобы ты видел ошибки в панели Railway
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 API_KEY = os.environ.get("GEMINI_API_KEY")
-# База данных теперь хранится в надежном месте Railway (или в /tmp для тестов)
-DB_PATH = "users_data.db" 
+# ВАЖНО: Только папка /tmp/ разрешена для записи в Railway!
+DB_PATH = "/tmp/users_medical_data.db" 
 
-# Инициализация ИИ (с автоподбором модели)
-genai.configure(api_key=API_KEY)
-def get_model():
-    models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    name = 'models/gemini-1.5-flash' if 'models/gemini-1.5-flash' in models else models[0]
-    return genai.GenerativeModel(name)
+# Инициализация ИИ
+def setup_ai():
+    try:
+        genai.configure(api_key=API_KEY)
+        # Опрашиваем доступные модели, чтобы не было ошибки 404
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        name = 'models/gemini-1.5-flash' if 'models/gemini-1.5-flash' in models else models[0]
+        logger.info(f"Используем модель: {name}")
+        return genai.GenerativeModel(name)
+    except Exception as e:
+        logger.error(f"Критическая ошибка ИИ: {e}")
+        return None
 
-model = get_model()
+model = setup_ai()
 
-# --- ЛОГИКА ИЗОЛЯЦИИ ДАННЫХ ---
-
+# --- БАЗА ДАННЫХ ---
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    # Создаем таблицу, где первичный ключ - это ID пользователя в Телеграм
-    conn.execute('''CREATE TABLE IF NOT EXISTS users 
-                    (user_id INTEGER PRIMARY KEY, info TEXT)''')
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, info TEXT)")
+        conn.close()
+        logger.info("База данных готова.")
+    except Exception as e:
+        logger.error(f"Ошибка БД: {e}")
 
 def get_user_info(user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -35,59 +46,47 @@ def get_user_info(user_id):
     conn.close()
     return res[0] if res else None
 
-def save_user_info(user_id, text):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO users (user_id, info) VALUES (?, ?)", (user_id, text))
-    conn.commit()
-    conn.close()
-
-# --- ОБРАБОТКА СООБЩЕНИЙ ---
-
+# --- ОБРАБОТКА ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id  # Уникальный ID каждого человека
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
     user_text = update.message.text
     
-    # Достаем данные ТОЛЬКО этого пользователя
-    current_profile = get_user_info(user_id)
+    # Изоляция: достаем данные ТОЛЬКО этого пользователя
+    profile = get_user_info(user_id)
     
-    # Инструкция для ИИ
-    if not current_profile:
-        system_instruction = (
-            "Ты — медицинский ассистент. Это НОВЫЙ пользователь. "
-            "Начни опрос вежливо: спроси пол, возраст и рост. "
-            "ЗАПРЕЩЕНО говорить про личные кабинеты. Ты сам проводишь опрос прямо здесь."
+    if not profile:
+        instruction = (
+            "Ты — медицинский ассистент. Это новый пользователь. "
+            "САМОЕ ВАЖНОЕ: Не говори про внешние анкеты. Ты сам проводишь опрос. "
+            "Спроси у него по очереди: пол, возраст, рост, вес и жалобы."
         )
     else:
-        system_instruction = (
-            f"Ты — медицинский ассистент. ДАННЫЕ ЭТОГО ПАЦИЕНТА: {current_profile}. "
-            "Отвечай на вопросы, используя этот контекст. Если он сообщает новые данные о здоровье — запомни их."
-        )
+        instruction = f"Ты — мед-ассистент. Данные этого пациента: {profile}. Отвечай, учитывая их."
 
     await update.message.reply_chat_action(ChatAction.TYPING)
     
     try:
-        response = model.generate_content(f"{system_instruction}\n\nСообщение пользователя: {user_text}")
-        response_text = response.text
-        
-        # Если ИИ в ответе зафиксировал данные (например, после опроса), 
-        # мы можем обновлять профиль. Для простоты пока просто даем ИИ вести диалог.
-        # В идеале: если в ответе есть ключевые слова, сохраняем info.
-        
-        await update.message.reply_text(response_text)
-        
+        response = model.generate_content(f"{instruction}\n\nЮзер: {user_text}")
+        await update.message.reply_text(response.text)
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
+        logger.error(f"Ошибка генерации: {e}")
+        await update.message.reply_text("⚠️ ИИ временно недоступен, попробуйте через минуту.")
 
 def main():
+    if not TOKEN or not API_KEY:
+        logger.error("Проверь переменные окружения в Railway!")
+        return
+
     init_db()
-    if not TOKEN: return
-    
-    # Railway запускает один экземпляр, который обслуживает ВСЕХ
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("Бот запущен и разделяет пользователей...")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Бот запущен...")
+    # Убираем drop_pending_updates, чтобы бот не «проглатывал» сообщения при старте
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
