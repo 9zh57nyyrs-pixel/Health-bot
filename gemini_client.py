@@ -6,40 +6,40 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 class GeminiClient:
     @staticmethod
-    async def get_response(user_id, text_input=None, photo_bytes=None):
-        profile, metrics = database.get_full_context(user_id)
+    async def get_medical_advice(user_id, message, is_photo=False, photo_data=None):
+        profile = database.get_profile(user_id)
         
-        # Формируем клиническую картину для ИИ
-        context = "КЛИНИЧЕСКАЯ КАРТИНА ПАЦИЕНТА:\n"
+        # Формируем глубокий контекст
+        context = "ПРОФИЛЬ ПАЦИЕНТА:\n"
         if profile:
-            context += f"- Возраст: {profile['age']}, Пол: {profile['gender']}, Вес: {profile['weight']}\n"
-            context += f"- Хронические заболевания: {profile['chronic_diseases'] or 'Не указано'}\n"
-        else:
-            context += "- ДАННЫЕ ОТСУТСТВУЮТ. ТРЕБУЕТСЯ АНКЕТИРОВАНИЕ.\n"
+            context += f"- Возраст: {profile.get('age', 'Не указан')}\n"
+            context += f"- Пол: {profile.get('gender', 'Не указан')}\n"
+            context += f"- Вес/Рост: {profile.get('weight')}/{profile.get('height')}\n"
+            context += f"- Анамнез: {profile.get('chronic_diseases', 'Нет данных')}\n"
         
-        system_prompt = f"""
-        Ты — ведущий врач-терапевт с 20-летним стажем. Твоя цель — превентивное здоровье.
+        instruction = f"""
+        Ты — высококвалифицированный врач-терапевт. Твоя задача — вести пациента.
         {context}
         
-        ТВОИ ЗАДАЧИ:
-        1. ИНИЦИАТИВА: Если в профиле не хватает данных (возраст, вес, пол), ты обязан ПРЕРВАТЬ любой разговор и вежливо запросить эти данные по одному.
-        2. АНАЛИЗ ФОТО: Если прислали анализы, разбери каждый пункт, сравни с нормами и выдели критические отклонения.
-        3. РЕКОМЕНДАЦИИ: На основе возраста (например, если >40 лет), сам предлагай ежегодный чекап (УЗИ, ПСА, Маммография).
-        4. СТИЛЬ: Профессиональный, но человечный. Избегай воды.
-        
-        ВНИМАНИЕ: Если пациент жалуется на симптомы 'красных флагов' (боль за грудиной, онемение лица), немедленно требуй вызвать скорую.
+        ТВОИ КОМПЕТЕНЦИИ:
+        1. Интерпретация анализов крови, мочи, УЗИ, МРТ.
+        2. Формирование плана обследований на основе возраста и жалоб.
+        3. Отслеживание динамики веса и давления.
+        4. Определение 'красных флагов' и немедленное направление к специалистам.
+
+        ПРАВИЛА:
+        - Если данных в профиле нет, настойчиво, но вежливо проси их предоставить.
+        - Никогда не ставь окончательный диагноз, используй формулировки 'высокая вероятность', 'рекомендуется исключить'.
+        - Обязательно добавляй юридический дисклеймер.
         """
 
+        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=instruction)
+        
         try:
-            model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_prompt)
-            
-            if photo_bytes:
-                content = [{"mime_type": "image/jpeg", "data": photo_bytes}, 
-                           text_input if text_input else "Проанализируй документ."]
-                response = model.generate_content(content)
+            if is_photo:
+                response = model.generate_content([{"mime_type": "image/jpeg", "data": photo_data}, message])
             else:
-                response = model.generate_content(text_input)
-            
+                response = model.generate_content(message)
             return response.text
         except Exception as e:
             return f"⚠️ Ошибка медицинского модуля: {str(e)}"
