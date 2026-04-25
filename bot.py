@@ -1,91 +1,100 @@
 import os
+import sys
 import sqlite3
 import logging
 import google.generativeai as genai
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Настройка логов, чтобы ты видел ошибки в панели Railway
-logging.basicConfig(level=logging.INFO)
+# Логирование
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
+# Переменные
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-API_KEY = os.environ.get("GEMINI_API_KEY")
-# ВАЖНО: Только папка /tmp/ разрешена для записи в Railway!
-DB_PATH = "/tmp/users_medical_data.db" 
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+DB_PATH = "/tmp/medical_bot.db"
 
-# Инициализация ИИ
+# 1. ФУНКЦИЯ АВТОПОДБОРА МОДЕЛИ (решает проблему 404 навсегда)
 def setup_ai():
     try:
-        genai.configure(api_key=API_KEY)
-        # Опрашиваем доступные модели, чтобы не было ошибки 404
+        genai.configure(api_key=GEMINI_KEY)
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        name = 'models/gemini-1.5-flash' if 'models/gemini-1.5-flash' in models else models[0]
-        logger.info(f"Используем модель: {name}")
-        return genai.GenerativeModel(name)
+        # Пробуем найти лучшую из доступных
+        priority = ['models/gemini-1.5-flash', 'models/gemini-1.5-flash-latest', 'models/gemini-pro']
+        for p in priority:
+            if p in models:
+                logger.info(f"Выбрана модель: {p}")
+                return genai.GenerativeModel(p)
+        return genai.GenerativeModel(models[0]) if models else None
     except Exception as e:
-        logger.error(f"Критическая ошибка ИИ: {e}")
+        logger.error(f"Ошибка ИИ: {e}")
         return None
 
-model = setup_ai()
+ai_model = setup_ai()
 
-# --- БАЗА ДАННЫХ ---
-def init_db():
+# 2. РАБОТА С ДАННЫМИ
+def get_context(uid):
     try:
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, info TEXT)")
+        res = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         conn.close()
-        logger.info("База данных готова.")
-    except Exception as e:
-        logger.error(f"Ошибка БД: {e}")
+        if res:
+            return f"Данные пациента: {res[1]}, возраст {res[2]}, болезни: {res[3]}, лекарства: {res[4]}."
+    except: pass
+    return "Данные анкеты отсутствуют. Напомни пользователю заполнить её."
 
-def get_user_info(user_id):
+async def save_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Формат: /anketa Муж 30 Гастрит Омез
+    u = update.effective_user.id
+    d = context.args
+    if len(d) < 4:
+        await update.message.reply_text("Используй: /anketa Пол Возраст Болезни Лекарства")
+        return
     conn = sqlite3.connect(DB_PATH)
-    res = conn.execute("SELECT info FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?)", (u, d[0], d[1], d[2], d[3], "Нет"))
+    conn.commit()
     conn.close()
-    return res[0] if res else None
+    await update.message.reply_text("✅ Анкета сохранена!")
 
-# --- ОБРАБОТКА ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+# 3. ОБРАБОТКА ТЕКСТА И ФОТО
+async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ai_model:
+        await update.message.reply_text("ИИ не инициализирован.")
         return
 
-    user_id = update.effective_user.id
-    user_text = update.message.text
-    
-    # Изоляция: достаем данные ТОЛЬКО этого пользователя
-    profile = get_user_info(user_id)
-    
-    if not profile:
-        instruction = (
-            "Ты — медицинский ассистент. Это новый пользователь. "
-            "САМОЕ ВАЖНОЕ: Не говори про внешние анкеты. Ты сам проводишь опрос. "
-            "Спроси у него по очереди: пол, возраст, рост, вес и жалобы."
-        )
-    else:
-        instruction = f"Ты — мед-ассистент. Данные этого пациента: {profile}. Отвечай, учитывая их."
+    content = [
+        "Ты — персональный медицинский ассистент. Используй данные пациента ниже для анализа.\n",
+        f"КОНТЕКСТ: {get_context(update.effective_user.id)}\n",
+        f"ЗАПРОС: {update.message.text or update.message.caption or 'Проанализируй это'}"
+    ]
+
+    # Если прислали фото (анализы или симптомы)
+    if update.message.photo:
+        await update.message.reply_chat_action(ChatAction.TYPING)
+        file = await update.message.photo[-1].get_file()
+        img_bytes = await file.download_as_bytearray()
+        content.append({"mime_type": "image/jpeg", "data": bytes(img_bytes)})
 
     await update.message.reply_chat_action(ChatAction.TYPING)
-    
     try:
-        response = model.generate_content(f"{instruction}\n\nЮзер: {user_text}")
-        await update.message.reply_text(response.text)
+        response = ai_model.generate_content(content)
+        # Отправка длинных сообщений
+        text = response.text
+        for i in range(0, len(text), 4000):
+            await update.message.reply_text(text[i:i+4000])
     except Exception as e:
-        logger.error(f"Ошибка генерации: {e}")
-        await update.message.reply_text("⚠️ ИИ временно недоступен, попробуйте через минуту.")
+        await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
 
 def main():
-    if not TOKEN or not API_KEY:
-        logger.error("Проверь переменные окружения в Railway!")
-        return
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, g TEXT, a TEXT, h TEXT, m TEXT, al TEXT)")
+    conn.close()
 
-    init_db()
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("Бот запущен...")
-    # Убираем drop_pending_updates, чтобы бот не «проглатывал» сообщения при старте
+    app.add_handler(CommandHandler("anketa", save_anketa))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_all))
     app.run_polling()
 
 if __name__ == '__main__':
