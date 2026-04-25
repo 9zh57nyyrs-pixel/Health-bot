@@ -361,7 +361,24 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_error_handler(error_handler)
     logger.info("✅ Бот запущен!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    # Railway: используем webhook если задан RAILWAY_PUBLIC_DOMAIN, иначе polling
+    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RAILWAY_STATIC_URL")
+    port = int(os.environ.get("PORT", 8080))
+
+    if railway_domain:
+        webhook_url = f"https://{railway_domain}/{token}"
+        logger.info(f"Webhook mode: {webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=token,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+        )
+    else:
+        logger.info("Polling mode")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
