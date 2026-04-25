@@ -1,45 +1,48 @@
 import google.generativeai as genai
 import os
-import database
+import logging
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# Настройка логирования для отладки на Railway
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class GeminiClient:
-    @staticmethod
-    async def get_medical_advice(user_id, message, is_photo=False, photo_data=None):
-        profile = database.get_profile(user_id)
+    def __init__(self):
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.error("GEMINI_API_KEY отсутствует в переменных окружения!")
+        genai.configure(api_key=api_key)
         
-        # Формируем глубокий контекст
-        context = "ПРОФИЛЬ ПАЦИЕНТА:\n"
-        if profile:
-            context += f"- Возраст: {profile.get('age', 'Не указан')}\n"
-            context += f"- Пол: {profile.get('gender', 'Не указан')}\n"
-            context += f"- Вес/Рост: {profile.get('weight')}/{profile.get('height')}\n"
-            context += f"- Анамнез: {profile.get('chronic_diseases', 'Нет данных')}\n"
+    async def get_response(self, prompt, context_data, photo_bytes=None):
+        # Список моделей для проверки доступности
+        model_names = ['gemini-1.5-flash', 'gemini-1.5-pro']
         
-        instruction = f"""
-        Ты — высококвалифицированный врач-терапевт. Твоя задача — вести пациента.
-        {context}
+        system_instruction = f"""
+        Ты — главный врач-терапевт. Твоя задача: проактивное ведение пациента.
+        ДАННЫЕ ПАЦИЕНТА: {context_data}
         
-        ТВОИ КОМПЕТЕНЦИИ:
-        1. Интерпретация анализов крови, мочи, УЗИ, МРТ.
-        2. Формирование плана обследований на основе возраста и жалоб.
-        3. Отслеживание динамики веса и давления.
-        4. Определение 'красных флагов' и немедленное направление к специалистам.
-
-        ПРАВИЛА:
-        - Если данных в профиле нет, настойчиво, но вежливо проси их предоставить.
-        - Никогда не ставь окончательный диагноз, используй формулировки 'высокая вероятность', 'рекомендуется исключить'.
-        - Обязательно добавляй юридический дисклеймер.
+        ТВОЙ ПРОТОКОЛ:
+        1. Если данных нет, начни опрос (возраст, вес, жалобы).
+        2. При получении анализов — делай сравнительную таблицу с нормой.
+        3. Если симптомы опасны — направляй к очному врачу.
         """
-
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=instruction)
         
-        try:
-            if is_photo:
-                response = model.generate_content([{"mime_type": "image/jpeg", "data": photo_data}, message])
-            else:
-                response = model.generate_content(message)
-            return response.text
-        except Exception as e:
-            return f"⚠️ Ошибка медицинского модуля: {str(e)}"
+        for m_name in model_names:
+            try:
+                model = genai.GenerativeModel(
+                    model_name=m_name,
+                    system_instruction=system_instruction
+                )
+                
+                if photo_bytes:
+                    content = [{"mime_type": "image/jpeg", "data": photo_bytes}, prompt]
+                else:
+                    content = prompt
+                
+                response = model.generate_content(content)
+                return response.text
+            except Exception as e:
+                logger.warning(f"Модель {m_name} недоступна: {e}")
+                continue
+        
+        return "❌ Ошибка: Все модели Gemini недоступны. Проверьте регион сервера или API ключ."
