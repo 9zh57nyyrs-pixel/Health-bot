@@ -188,8 +188,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, response)
     except Exception as e:
         logger.error("Claude error: " + str(e))
-        await reply(update, "Произошла ошибка. Попробуйте ещё раз.")
-
+        await reply(update, "Ошибка: " + str(e))
 
 def main():
     init_db()
