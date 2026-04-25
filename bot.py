@@ -5,53 +5,60 @@ import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Логи в консоль Railway
+# Логирование для отслеживания процесса в Railway
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Настройка ИИ с учетом твоей ошибки 404
+# Настройка ИИ с использованием стабильной модели
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    # Используем проверенное имя модели
-    model = genai.GenerativeModel('gemini-1.5-flash') 
+    # Используем 'gemini-pro', она наиболее совместима и не выдает 404
+    model = genai.GenerativeModel('gemini-pro')
 else:
     model = None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Бот на связи! Попробуй отправить вопрос сейчас.")
+    await update.message.reply_text(
+        "Бот запущен и готов к работе. Расскажите о себе (пол, возраст, вес, жалобы), "
+        "и я дам рекомендации на основе этих данных."
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not model:
-        await update.message.reply_text("❌ Ошибка: Ключ GEMINI_API_KEY не найден.")
+        await update.message.reply_text("❌ Ошибка: API ключ не настроен в Variables.")
         return
 
     await update.message.reply_chat_action("typing")
     
+    user_text = update.message.text
+    
     try:
-        # Прямой вызов без лишних оберток
-        response = model.generate_content(update.message.text)
+        # Прямой запрос к ИИ
+        response = model.generate_content(user_text)
         
         if response and response.text:
             await update.message.reply_text(response.text)
         else:
-            await update.message.reply_text("ИИ не смог сформулировать ответ.")
+            await update.message.reply_text("ИИ получил запрос, но не смог сгенерировать текст. Попробуйте уточнить вопрос.")
             
     except Exception as e:
-        # Если снова будет 404, мы увидим подробности
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        # Если возникнет любая ошибка, бот сразу выведет её текст
+        logger.error(f"Ошибка Gemini: {e}")
+        await update.message.reply_text(f"Произошла техническая ошибка: {str(e)}")
 
 def main():
     if not TOKEN:
-        print("НЕТ ТОКЕНА ТЕЛЕГРАМ")
+        print("Критическая ошибка: TELEGRAM_TOKEN не найден!")
         return
         
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("--- ЗАПУСК ПОЛЛИНГА ---", flush=True)
+    print("--- БОТ ЗАПУЩЕН И ГОТОВ К ОБЩЕНИЮ ---", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
