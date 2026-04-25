@@ -1,8 +1,11 @@
 import base64
-import anthropic
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MAX_TOKENS
+import urllib.request
+import urllib.error
+import json
+import os
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key="
 
 SYSTEM_PROMPT = """Ты персональный ИИ-врач для русскоязычных пользователей.
 
@@ -35,57 +38,98 @@ SYSTEM_PROMPT = """Ты персональный ИИ-врач для русск
 Ты ИИ и не заменяешь настоящего врача."""
 
 
-def chat(history, profile=""):
-    system = SYSTEM_PROMPT
+def build_gemini_contents(history, profile=""):
+    contents = []
+
     if profile and profile.strip():
-        system += "\n\nПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ (накоплено из прошлых разговоров):\n" + profile
+        contents.append({
+            "role": "user",
+            "parts": [{"text": "Мой профиль здоровья: " + profile}]
+        })
+        contents.append({
+            "role": "model",
+            "parts": [{"text": "Понял, учту все данные вашего профиля."}]
+        })
 
-    messages = [{"role": r["role"], "content": r["content"]} for r in history]
+    for msg in history:
+        role = "model" if msg["role"] == "assistant" else "user"
+        contents.append({
+            "role": role,
+            "parts": [{"text": msg["content"]}]
+        })
 
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system,
-        messages=messages
+    return contents
+
+
+def gemini_request(contents):
+    url = GEMINI_URL + GEMINI_API_KEY
+    body = {
+        "system_instruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": 2048,
+            "temperature": 0.7
+        }
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
     )
-    return response.content[0].text
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    return result["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def chat(history, profile=""):
+    contents = build_gemini_contents(history, profile)
+    return gemini_request(contents)
 
 
 def chat_with_image(image_bytes, caption, history, profile=""):
-    system = SYSTEM_PROMPT
-    if profile and profile.strip():
-        system += "\n\nПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ:\n" + profile
+    contents = build_gemini_contents(history, profile)
 
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-
-    messages = [{"role": r["role"], "content": r["content"]} for r in history]
-
     text = caption if caption else "Расшифруй этот медицинский документ подробно на русском языке."
-    messages.append({
+
+    contents.append({
         "role": "user",
-        "content": [
+        "parts": [
             {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
+                "inline_data": {
+                    "mime_type": "image/jpeg",
                     "data": image_b64
                 }
             },
-            {
-                "type": "text",
-                "text": text
-            }
+            {"text": text}
         ]
     })
 
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system,
-        messages=messages
+    url = GEMINI_URL + GEMINI_API_KEY
+    body = {
+        "system_instruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": 2048,
+            "temperature": 0.7
+        }
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
     )
-    return response.content[0].text
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def update_profile(history, old_profile):
@@ -95,19 +139,29 @@ def update_profile(history, old_profile):
         who = "Пользователь" if m["role"] == "user" else "Врач"
         dialog += who + ": " + m["content"] + "\n"
 
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=600,
-        system="Ты извлекаешь медицинские факты. Отвечай только на русском. Только факты, без советов.",
-        messages=[{
-            "role": "user",
-            "content": (
-                "Старый профиль:\n" + (old_profile or "нет данных") +
-                "\n\nНовый диалог:\n" + dialog +
-                "\n\nОбнови профиль — добавь новые факты о здоровье. "
-                "Формат: короткие строки. Возраст, пол, рост, вес, диагнозы, лекарства, привычки, жалобы, анализы. "
-                "Если новых данных нет — верни старый профиль без изменений."
-            )
-        }]
+    contents = [{
+        "role": "user",
+        "parts": [{"text": (
+            "Старый профиль:\n" + (old_profile or "нет данных") +
+            "\n\nНовый диалог:\n" + dialog +
+            "\n\nОбнови профиль — добавь новые факты о здоровье. "
+            "Формат: короткие строки. Возраст, пол, рост, вес, диагнозы, лекарства, привычки, жалобы, анализы. "
+            "Только факты, без советов. Если новых данных нет — верни старый профиль без изменений."
+        )}]
+    }]
+
+    url = GEMINI_URL + GEMINI_API_KEY
+    body = {
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 600}
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
     )
-    return response.content[0].text
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    return result["candidates"][0]["content"]["parts"][0]["text"]
