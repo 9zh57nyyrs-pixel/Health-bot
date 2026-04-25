@@ -5,56 +5,67 @@ import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Логирование в реальном времени
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+# Настройка вывода логов
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
 
-# Ключи
+# Получение ключей
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Настройка ИИ вынесена в функцию
-def configure_ai():
-    if not GEMINI_KEY:
-        return None
-    genai.configure(api_key=GEMINI_KEY)
-    return genai.GenerativeModel('gemini-1.5-flash')
-
-model = configure_ai()
+# Настройка ИИ (асинхронная модель)
+genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот онлайн. Напиши мне вопрос для ИИ.")
+    await update.message.reply_text("✅ Бот на связи. Отправьте ваш вопрос или фото.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not model:
-        await update.message.reply_text("Ошибка: API ключ Gemini не найден в настройках Railway!")
-        return
-
-    user_text = update.message.text
-    print(f"Запрос к ИI: {user_text}", flush=True)
+    # Берем текст из сообщения или подписи к фото
+    prompt = update.message.text or update.message.caption or "Проанализируй это изображение"
     
+    # Визуальный индикатор "печатает"
     await update.message.reply_chat_action("typing")
     
+    content = [prompt]
+    
+    # Если есть фото, качаем и добавляем в запрос
+    if update.message.photo:
+        file = await update.message.photo[-1].get_file()
+        img_bytes = await file.download_as_bytearray()
+        content.append({"mime_type": "image/jpeg", "data": bytes(img_bytes)})
+
     try:
-        # Используем асинхронный вызов, чтобы бот не зависал
-        response = await model.generate_content_async(user_text)
-        await update.message.reply_text(response.text)
+        # Критически важно: асинхронный вызов generate_content_async
+        response = await model.generate_content_async(content)
+        
+        if response.text:
+            await update.message.reply_text(response.text, parse_mode='Markdown')
+        else:
+            await update.message.reply_text("ИИ вернул пустой ответ.")
+            
     except Exception as e:
-        error_msg = f"Ошибка связи с ИИ: {str(e)}"
-        logger.error(error_msg)
-        await update.message.reply_text("ИИ временно недоступен. Проверь логи Railway.")
+        logger.error(f"Ошибка Gemini: {e}")
+        await update.message.reply_text(f"❌ Ошибка ИИ: {str(e)}")
 
 def main():
-    if not TOKEN:
-        print("КРИТИЧЕСКАЯ ОШИБКА: Нет TELEGRAM_TOKEN!", flush=True)
+    if not TOKEN or not GEMINI_KEY:
+        print("ОШИБКА: Проверьте TELEGRAM_TOKEN и GEMINI_API_KEY в Railway!", flush=True)
         return
-    
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("--- БОТ ЗАПУЩЕН ---", flush=True)
-    app.run_polling(drop_pending_updates=True)
+
+    # Создание приложения
+    application = Application.builder().token(TOKEN).build()
+
+    # Хендлеры
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
+
+    print("--- ЗАПУСК БОТА ---", flush=True)
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
