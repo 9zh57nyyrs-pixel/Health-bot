@@ -7,97 +7,94 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- НАСТРОЙКИ ---
+# Логирование
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+logger = logging.getLogger(__name__)
+
+# Переменные
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 DB_PATH = "/tmp/medical_bot.db"
 
-# Инициализация ИИ
-genai.configure(api_key=GEMINI_KEY)
-# Используем flash для скорости или pro для точности
-model = genai.GenerativeModel('gemini-1.5-flash') 
+# 1. ФУНКЦИЯ АВТОПОДБОРА МОДЕЛИ (решает проблему 404 навсегда)
+def setup_ai():
+    try:
+        genai.configure(api_key=GEMINI_KEY)
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        # Пробуем найти лучшую из доступных
+        priority = ['models/gemini-1.5-flash', 'models/gemini-1.5-flash-latest', 'models/gemini-pro']
+        for p in priority:
+            if p in models:
+                logger.info(f"Выбрана модель: {p}")
+                return genai.GenerativeModel(p)
+        return genai.GenerativeModel(models[0]) if models else None
+    except Exception as e:
+        logger.error(f"Ошибка ИИ: {e}")
+        return None
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''CREATE TABLE IF NOT EXISTS users 
-                    (id INTEGER PRIMARY KEY, gender TEXT, age TEXT, 
-                     history TEXT, meds TEXT, allergies TEXT)''')
-    conn.close()
+ai_model = setup_ai()
 
-def save_user(uid, gender, age, history, meds, allergies):
+# 2. РАБОТА С ДАННЫМИ
+def get_context(uid):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        res = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        conn.close()
+        if res:
+            return f"Данные пациента: {res[1]}, возраст {res[2]}, болезни: {res[3]}, лекарства: {res[4]}."
+    except: pass
+    return "Данные анкеты отсутствуют. Напомни пользователю заполнить её."
+
+async def save_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Формат: /anketa Муж 30 Гастрит Омез
+    u = update.effective_user.id
+    d = context.args
+    if len(d) < 4:
+        await update.message.reply_text("Используй: /anketa Пол Возраст Болезни Лекарства")
+        return
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?)", 
-                 (uid, gender, age, history, meds, allergies))
+    conn.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?)", (u, d[0], d[1], d[2], d[3], "Нет"))
     conn.commit()
     conn.close()
+    await update.message.reply_text("✅ Анкета сохранена!")
 
-def get_user(uid):
-    conn = sqlite3.connect(DB_PATH)
-    res = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    conn.close()
-    if res:
-        return f"Пациент: {res[1]}, {res[2]} лет. Анамнез: {res[3]}. Лекарства: {res[4]}. Аллергии: {res[5]}."
-    return None
+# 3. ОБРАБОТКА ТЕКСТА И ФОТО
+async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ai_model:
+        await update.message.reply_text("ИИ не инициализирован.")
+        return
 
-# --- ЛОГИКА БОТА ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Здравствуйте! Я ваш медицинский ассистент.\n\n"
-        "Чтобы я мог давать точные рекомендации, заполните анкету командой:\n"
-        "/anketa [Пол] [Возраст] [Болезни] [Лекарства] [Аллергии]\n\n"
-        "Пример:\n/anketa Муж 35 Гастрит Омез Нет"
-    )
+    content = [
+        "Ты — персональный медицинский ассистент. Используй данные пациента ниже для анализа.\n",
+        f"КОНТЕКСТ: {get_context(update.effective_user.id)}\n",
+        f"ЗАПРОС: {update.message.text or update.message.caption or 'Проанализируй это'}"
+    ]
 
-async def set_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        # Упрощенный парсинг для примера
-        args = context.args
-        if len(args) < 5:
-            await update.message.reply_text("Ошибка! Введите: /anketa Пол Возраст Болезни Лекарства Аллергии")
-            return
-        
-        save_user(update.effective_user.id, args[0], args[1], args[2], args[3], args[4])
-        await update.message.reply_text("✅ Данные сохранены! Теперь можете задавать вопросы.")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка сохранения: {e}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data = get_user(user_id)
-    user_query = update.message.text
-
-    # Формируем инструкцию для ИИ
-    system_prompt = (
-        "Ты — высококвалифицированный медицинский ассистент. Твоя задача — помогать пользователю анализировать симптомы "
-        "и давать рекомендации по следующим шагам (к какому врачу пойти, какие уточняющие вопросы себе задать).\n"
-        "ВАЖНО: Всегда добавляй дисклеймер, что ты не заменяешь врача.\n\n"
-    )
-    
-    if user_data:
-        full_prompt = f"{system_prompt} КОНТЕКСТ ПАЦИЕНТА: {user_data}\n\n ВОПРОС: {user_query}"
-    else:
-        full_prompt = f"{system_prompt} (Данных о пациенте нет, попроси его заполнить анкету если это важно).\n\n ВОПРОС: {user_query}"
+    # Если прислали фото (анализы или симптомы)
+    if update.message.photo:
+        await update.message.reply_chat_action(ChatAction.TYPING)
+        file = await update.message.photo[-1].get_file()
+        img_bytes = await file.download_as_bytearray()
+        content.append({"mime_type": "image/jpeg", "data": bytes(img_bytes)})
 
     await update.message.reply_chat_action(ChatAction.TYPING)
-    
     try:
-        response = model.generate_content(full_prompt)
-        # Если ответ слишком длинный, режем его (защита от ошибки Message too long)
+        response = ai_model.generate_content(content)
+        # Отправка длинных сообщений
         text = response.text
         for i in range(0, len(text), 4000):
             await update.message.reply_text(text[i:i+4000])
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка ИИ: {e}")
+        await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
 
-# --- ЗАПУСК ---
 def main():
-    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, g TEXT, a TEXT, h TEXT, m TEXT, al TEXT)")
+    conn.close()
+
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("anketa", set_anketa))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("anketa", save_anketa))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_all))
     app.run_polling()
 
 if __name__ == '__main__':
