@@ -1,12 +1,10 @@
 import os
 import logging
-import sqlite3
+import psycopg2
 import re
 import io
 import asyncio
-from datetime import datetime
 from PIL import Image
-
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from telegram import Update, ReplyKeyboardMarkup, constants
@@ -14,176 +12,191 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler,
 )
 
-# --- ГЛУБОКОЕ ЛОГИРОВАНИЕ ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("HealthMaster")
+# --- ГЛУБОКИЙ МОНИТОРИНГ ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("MedicalEliteBot")
 
-# --- КОНФИГУРАЦИЯ ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DB_PATH = "health_v3_core.db"
+# --- КОНФИГУРАЦИЯ СИСТЕМЫ ---
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+AI_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL") # Railway подставит это сам
 
 GENDER, AGE, WEIGHT, HEIGHT, DISEASES, CHAT_MODE = range(6)
 
-# --- ИНИЦИАЛИЗАЦИЯ ИИ (СНЯТИЕ БЛОКИРОВОК) ---
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# --- ПРОДВИНУТЫЙ ИИ (ВРАЧ-ТЕРАПЕВТ) ---
+if AI_KEY:
+    genai.configure(api_key=AI_KEY)
 
-# Отключаем все фильтры, чтобы Gemini не блокировал медицинские советы
-SAFETY_SETTINGS = {
+# Полное отключение фильтров для медицинских целей
+AI_SAFETY = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-class MedicalAI:
+class EliteDoctorAI:
     def __init__(self):
         self.model = genai.GenerativeModel(
             model_name='gemini-1.5-flash',
-            safety_settings=SAFETY_SETTINGS,
+            safety_settings=AI_SAFETY,
             system_instruction=(
-                "Ты — элитный врач-терапевт. Твоя задача: анализировать состояние пациента, "
-                "учитывая его пол, возраст, вес и историю болезней. Давай развернутые рекомендации. "
-                "Если присылают фото анализов — расшифровывай их максимально подробно."
+                "Ты — элитный цифровой врач-терапевт. Твоя база знаний включает все современные протоколы лечения. "
+                "Ты анализируешь пол, возраст, вес и анамнез пациента. Твои ответы должны быть глубокими, "
+                "профессиональными и помогать человеку понять его состояние. Если прислали фото анализов — делай полный разбор."
             )
         )
 
-    async def generate_response(self, profile, message, image=None):
+    async def consult(self, profile, query, image=None):
+        ctx = f"ПАЦИЕНТ: {profile['g']}, {profile['a']} лет, {profile['w']}кг, {profile['h']}см. БОЛЕЗНИ: {profile['d']}\nЗАПРОС: {query}"
         try:
-            # Формируем глубокий контекст для ИИ
-            full_prompt = (
-                f"ПАЦИЕНТ: {profile['gender']}, {profile['age']} лет, {profile['weight']}кг, {profile['height']}см.\n"
-                f"АНАМНЕЗ: {profile['diseases']}\n\n"
-                f"ВОПРОС: {message}"
-            )
-            content = [full_prompt, image] if image else full_prompt
-            response = await asyncio.to_thread(self.model.generate_content, content)
-            return response.text
+            res = await asyncio.to_thread(self.model.generate_content, [ctx, image] if image else ctx)
+            return res.text
         except Exception as e:
-            logger.error(f"AI ERROR: {e}")
-            return "⚠️ Произошла ошибка при анализе данных. Попробуйте переформулировать запрос."
+            logger.error(f"AI Crash: {e}")
+            return "🩺 Мои нейронные связи временно перегружены. Пожалуйста, повторите вопрос короче."
 
-ai_engine = MedicalAI()
+doctor = EliteDoctorAI()
 
-# --- ЯДРО БАЗЫ ДАННЫХ ---
+# --- СЛОЙ ВЕЧНОЙ ПАМЯТИ (POSTGRESQL) ---
+def get_db_conn():
+    # Если PostgreSQL нет, используем SQLite как запасной вариант
+    if DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL, sslmode='require')
+    import sqlite3
+    return sqlite3.connect("local_backup.db")
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS users 
-            (id INTEGER PRIMARY KEY, gender TEXT, age INTEGER, weight REAL, height REAL, diseases TEXT)''')
-        conn.commit()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute('''CREATE TABLE IF NOT EXISTS users 
+        (id BIGINT PRIMARY KEY, gender TEXT, age INT, weight REAL, height REAL, diseases TEXT)''')
+    conn.commit()
+    cur.close()
+    conn.close()
 
-def get_user(user_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-
-# --- ЛОГИКА БОТА ---
-def main_menu():
-    return ReplyKeyboardMarkup([['🧬 Консультация', '📋 Моя медкарта'], ['🆘 SOS']], resize_keyboard=True)
-
+# --- ЛОГИКА ВЗАИМОДЕЙСТВИЯ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
+    uid = update.effective_user.id
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
     if user:
-        await update.message.reply_text("👋 Доктор готов к работе. Что вас беспокоит?", reply_markup=main_menu())
+        await update.message.reply_text(
+            "👋 Рад вас видеть. Я изучил вашу медкарту. Какой медицинский вопрос вас беспокоит?",
+            reply_markup=ReplyKeyboardMarkup([['📋 Моя карта', '🧬 Консультация'], ['🆘 SOS']], resize_keyboard=True)
+        )
         return CHAT_MODE
     
     await update.message.reply_text(
-        "Здравствуйте! Я — ваш продвинутый медицинский ИИ-ассистент.\n"
-        "Чтобы мои советы были точными, давайте заполним вашу карту. Ваш пол?",
+        "Здравствуйте. Я ваш персональный медицинский эксперт.\nЧтобы рекомендации были точными, мне нужно создать ваш профиль. Ваш пол?",
         reply_markup=ReplyKeyboardMarkup([['Мужской', 'Женский']], one_time_keyboard=True)
     )
     return GENDER
 
-async def collect_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    state = context.user_data.get('step', GENDER)
+async def collect_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    # Простая машина состояний через context.user_data
+    if 'reg_data' not in context.user_data: context.user_data['reg_data'] = {}
+    rd = context.user_data['reg_data']
 
-    if state == GENDER:
-        context.user_data['gender'] = text
-        await update.message.reply_text("Укажите ваш возраст:")
-        context.user_data['step'] = AGE
+    if 'gender' not in rd:
+        rd['gender'] = txt
+        await update.message.reply_text("Ваш возраст?")
         return AGE
-    elif state == AGE:
-        context.user_data['age'] = int(re.search(r'\d+', text).group())
-        await update.message.reply_text("Ваш текущий вес (кг):")
-        context.user_data['step'] = WEIGHT
+    elif 'age' not in rd:
+        rd['age'] = int(re.search(r'\d+', txt).group())
+        await update.message.reply_text("Ваш вес (кг)?")
         return WEIGHT
-    elif state == WEIGHT:
-        context.user_data['weight'] = float(re.search(r'\d+', text).group())
-        await update.message.reply_text("Ваш рост (см):")
-        context.user_data['step'] = HEIGHT
+    elif 'weight' not in rd:
+        rd['weight'] = float(re.search(r'\d+', txt).group())
+        await update.message.reply_text("Ваш рост (см)?")
         return HEIGHT
-    elif state == HEIGHT:
-        context.user_data['height'] = float(re.search(r'\d+', text).group())
-        await update.message.reply_text("Есть ли хронические заболевания? (или 'Нет')")
-        context.user_data['step'] = DISEASES
+    elif 'height' not in rd:
+        rd['height'] = float(re.search(r'\d+', txt).group())
+        await update.message.reply_text("Перечислите хронические заболевания (или напишите 'Нет'):")
         return DISEASES
 
-async def save_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    d = update.message.text
-    ud = context.user_data
+async def save_and_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    dis = update.message.text
+    rd = context.user_data['reg_data']
     
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?)", 
-                     (user_id, ud['gender'], ud['age'], ud['weight'], ud['height'], d))
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET diseases=%s",
+                (uid, rd['gender'], rd['age'], rd['weight'], rd['height'], dis, dis))
+    conn.commit()
+    cur.close()
+    conn.close()
     
-    await update.message.reply_text("✅ Карта сохранена! Теперь вы в надежных руках.", reply_markup=main_menu())
+    await update.message.reply_text("✅ Медкарта сохранена навсегда. Я готов к консультации.", 
+                                   reply_markup=ReplyKeyboardMarkup([['📋 Моя карта', '🧬 Консультация'], ['🆘 SOS']], resize_keyboard=True))
     return CHAT_MODE
 
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
-    text = update.message.text
-
-    if not user: return await start(update, context)
-
-    if text == '📋 Моя медкарта':
-        await update.message.reply_text(f"📊 Ваш профиль: {user[1]}, {user[2]}л, {user[3]}кг, {user[4]}см. Болезни: {user[5]}")
-        return CHAT_MODE
+async def global_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    msg = update.message.text
     
-    if text == '🆘 SOS':
-        await update.message.reply_text("🚨 Срочно вызывайте скорую: 103 или 112!")
-        return CHAT_MODE
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
+    u = cur.fetchone()
+    cur.close()
+    conn.close()
 
-    await update.message.reply_chat_action(constants.ChatAction.TYPING)
-    
-    profile = {"gender": user[1], "age": user[2], "weight": user[3], "height": user[4], "diseases": user[5]}
-    response = await ai_engine.generate_response(profile, text)
-    
-    await update.message.reply_text(response, parse_mode='Markdown')
+    if not u: return await start(update, context)
+    profile = {'g': u[1], 'a': u[2], 'w': u[3], 'h': u[4], 'd': u[5]}
+
+    if msg == '📋 Моя карта':
+        await update.message.reply_text(f"📊 Данные: {u[1]}, {u[2]}л, {u[3]}кг, {u[4]}см.\nБолезни: {u[5]}")
+    elif msg == '🆘 SOS':
+        await update.message.reply_text("🚨 Срочно звоните 103 или 112!")
+    else:
+        await update.message.reply_chat_action(constants.ChatAction.TYPING)
+        ans = await doctor.consult(profile, msg)
+        await update.message.reply_text(ans, parse_mode='Markdown')
     return CHAT_MODE
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
-    if not user: return
-    
-    await update.message.reply_text("🧪 Анализирую изображение... Секунду.")
+async def photo_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
+    u = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    await update.message.reply_text("🔬 Врач изучает анализы...")
     photo = await update.message.photo[-1].get_file()
     img = Image.open(io.BytesIO(await photo.download_as_bytearray()))
     
-    profile = {"gender": user[1], "age": user[2], "weight": user[3], "height": user[4], "diseases": user[5]}
-    response = await ai_engine.generate_response(profile, "Проанализируй этот медицинский документ.", img)
-    await update.message.reply_text(response, parse_mode='Markdown')
+    profile = {'g': u[1], 'a': u[2], 'w': u[3], 'h': u[4], 'd': u[5]}
+    ans = await doctor.consult(profile, "Разбери анализы на фото.", img)
+    await update.message.reply_text(ans, parse_mode='Markdown')
 
 def main():
     init_db()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
     
     conv = ConversationHandler(
         entry_points=[CommandHandler('start', start), MessageHandler(filters.ALL, start)],
         states={
-            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_data)],
-            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_data)],
-            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_data)],
-            HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_data)],
-            DISEASES: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_profile)],
+            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_process)],
+            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_process)],
+            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_process)],
+            HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_process)],
+            DISEASES: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_and_finish)],
             CHAT_MODE: [
-                MessageHandler(filters.PHOTO, handle_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, chat)
+                MessageHandler(filters.PHOTO, photo_analysis),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, global_chat)
             ],
         },
-        fallbacks=[CommandHandler('start', start)],
-        allow_reentry=True
+        fallbacks=[CommandHandler('start', start)]
     )
     
     app.add_handler(conv)
