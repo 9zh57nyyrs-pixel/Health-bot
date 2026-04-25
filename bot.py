@@ -118,13 +118,7 @@ _model = None
 def init_gemini(api_key):
     global _model
     genai.configure(api_key=api_key)
-    try:
-        available = {m.name for m in genai.list_models()}
-        logger.info(f"Available models: {available}")
-    except Exception as e:
-        logger.warning(f"Cannot list models: {e}")
-        available = set()
-    chosen = next((n for n in MODELS if f"models/{n}" in available or n in available), MODELS[0])
+    chosen = MODELS[0]
     logger.info(f"Using model: {chosen}")
     _model = genai.GenerativeModel(
         model_name=chosen, system_instruction=SYSTEM_PROMPT, safety_settings=SAFETY,
