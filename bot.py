@@ -9,219 +9,193 @@ from PIL import Image
 
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler,
 )
 
-# --- ГЛУБОКОЕ ЛОГИРОВАНИЕ ---
+# --- ПРОФЕССИОНАЛЬНОЕ ЛОГИРОВАНИЕ ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("MedicalBotCore")
 
-# --- ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
+# --- КОНФИГУРАЦИЯ ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DB_PATH = os.path.join(os.getcwd(), "medical_system_v2.db")
+DB_PATH = "medical_system_v3.db"
 
+# Состояния диалога
 GENDER, AGE, WEIGHT, HEIGHT, DISEASES, CHAT_MODE = range(6)
 
-# --- ПРОДВИНУТАЯ КОНФИГУРАЦИЯ ИИ ---
+# --- ИНИЦИАЛИЗАЦИЯ ИИ С НУЛЕВЫМИ ФИЛЬТРАМИ ---
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Снимаем все ограничения, чтобы врач мог отвечать на любые вопросы
-SAFETY_SETTINGS = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-]
+# Настройка для медицинского контекста (отключаем блокировки)
+SAFETY = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+}
 
-class MedicalAI:
+class MedicalEngine:
     def __init__(self):
-        self.model = None
-        self.reinit_model()
+        self.model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            safety_settings=SAFETY,
+            system_instruction=(
+                "Ты — продвинутый цифровой врач-терапевт. Твоя цель — помогать пациентам, "
+                "основываясь на их данных (возраст, вес, болезни). Давай глубокую диагностику, "
+                "но всегда напоминай о важности очного визита."
+            )
+        )
 
-    def reinit_model(self):
-        # Перебор моделей от мощных к быстрым
-        for m_name in ['gemini-1.5-pro-latest', 'gemini-1.5-flash-latest', 'gemini-pro']:
-            try:
-                self.model = genai.GenerativeModel(
-                    model_name=m_name,
-                    safety_settings=SAFETY_SETTINGS,
-                    system_instruction=(
-                        "Ты — высококвалифицированный врач-терапевт с 20-летним стажем. "
-                        "Твоя задача: анализировать данные пациента (пол, возраст, вес) и давать "
-                        "структурированные медицинские рекомендации. Будь профессионален, "
-                        "используй медицинские термины, но объясняй их понятно."
-                    )
-                )
-                logger.info(f"Инициализирована модель: {m_name}")
-                break
-            except Exception as e:
-                logger.error(f"Ошибка инициализации {m_name}: {e}")
-
-    async def ask(self, prompt, image=None):
+    async def generate_response(self, user_profile, user_message, image=None):
+        prompt = (
+            f"ПРОФИЛЬ ПАЦИЕНТА: {user_profile['gender']}, {user_profile['age']} лет, "
+            f"вес {user_profile['weight']}кг, рост {user_profile['height']}см. "
+            f"Анамнез: {user_profile['diseases']}.\n"
+            f"ЗАПРОС: {user_message}"
+        )
         try:
             content = [prompt, image] if image else prompt
             response = await asyncio.to_thread(self.model.generate_content, content)
             return response.text
         except Exception as e:
-            logger.error(f"Критическая ошибка Gemini: {e}")
-            self.reinit_model() # Пробуем восстановить модель
-            return "⚠️ Произошел технический сбой в нейросети. Пожалуйста, повторите запрос через 10 секунд."
+            logger.error(f"Gemini API Error: {e}")
+            return "🩺 Мои системы временно перегружены. Попробуйте переформулировать вопрос."
 
-ai_doctor = MedicalAI()
+engine = MedicalEngine()
 
-# --- ЯДРО БАЗЫ ДАННЫХ ---
-class Database:
-    def __init__(self, path):
-        self.path = path
-        self._create_table()
-
-    def _create_table(self):
-        with sqlite3.connect(self.path) as conn:
-            conn.execute('''CREATE TABLE IF NOT EXISTS patients 
-                (id INTEGER PRIMARY KEY, gender TEXT, age INTEGER, 
-                 weight REAL, height REAL, history TEXT, created_at TEXT)''')
+# --- СЛОЙ БАЗЫ ДАННЫХ ---
+def db_manage(query, params=(), fetch=False):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(query, params)
+            if fetch: return cur.fetchone()
             conn.commit()
+    except Exception as e:
+        logger.error(f"Database Error: {e}")
+        return None
 
-    def save_patient(self, user_id, data):
-        with sqlite3.connect(self.path) as conn:
-            conn.execute('''INSERT OR REPLACE INTO patients VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                         (user_id, data['gender'], data['age'], data['weight'], 
-                          data['height'], data['diseases'], datetime.now().isoformat()))
-            conn.commit()
+def init_system():
+    db_manage('''CREATE TABLE IF NOT EXISTS users 
+                 (id INTEGER PRIMARY KEY, gender TEXT, age INTEGER, weight REAL, height REAL, diseases TEXT)''')
 
-    def get_patient(self, user_id):
-        with sqlite3.connect(self.path) as conn:
-            return conn.execute("SELECT * FROM patients WHERE id=?", (user_id,)).fetchone()
-
-db = Database(DB_PATH)
-
-# --- ИНТЕРФЕЙС И ЛОГИКА ---
-def get_main_kb():
-    return ReplyKeyboardMarkup([['🧬 Новая консультация', '📋 Моя карта'], ['🆘 SOS']], resize_keyboard=True)
+# --- ЛОГИКА ИНТЕРФЕЙСА ---
+def main_kb():
+    return ReplyKeyboardMarkup([['🧬 Консультация', '📋 Моя карта'], ['🆘 SOS']], resize_keyboard=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = db.get_patient(update.effective_user.id)
+    user_id = update.effective_user.id
+    user = db_manage("SELECT * FROM users WHERE id=?", (user_id,), fetch=True)
+    
     if user:
-        await update.message.reply_text(
-            f"С возвращением! Я ознакомился с вашей картой. Что вас беспокоит сегодня?",
-            reply_markup=get_main_kb()
-        )
+        await update.message.reply_text("👋 Система готова. Доктор на связи.", reply_markup=main_kb())
         return CHAT_MODE
     
     await update.message.reply_text(
-        "Здравствуйте. Я ваш персональный медицинский эксперт. Для точности рекомендаций "
-        "мне необходимо завести вашу медицинскую карту. Укажите ваш пол:",
+        "Добро пожаловать в интеллектуальную медицинскую систему.\n"
+        "Для начала работы необходимо создать вашу цифровую карту. Ваш пол?",
         reply_markup=ReplyKeyboardMarkup([['Мужской', 'Женский']], one_time_keyboard=True)
     )
     return GENDER
 
-async def collect_step(update: Update, context: ContextTypes.DEFAULT_TYPE, next_state, msg, key):
-    raw_text = update.message.text
-    context.user_data[key] = raw_text
-    await update.message.reply_text(msg)
-    return next_state
+async def collect_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['gender'] = update.message.text
+    await update.message.reply_text("Укажите ваш возраст:")
+    return AGE
 
-# Промежуточные шаги с валидацией
-async def c_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    nums = re.findall(r'\d+', update.message.text)
-    if not nums: 
-        await update.message.reply_text("Пожалуйста, введите возраст цифрами.")
-        return AGE
-    context.user_data['age'] = int(nums[0])
-    await update.message.reply_text("Ваш текущий вес в килограммах?")
+async def collect_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    age = re.findall(r'\d+', update.message.text)
+    if not age: return AGE
+    context.user_data['age'] = int(age[0])
+    await update.message.reply_text("Ваш вес (кг):")
     return WEIGHT
 
-async def c_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    nums = re.findall(r'\d+', update.message.text)
-    if not nums: return WEIGHT
-    context.user_data['weight'] = float(nums[0])
-    await update.message.reply_text("Ваш рост в сантиметрах?")
+async def collect_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    w = re.findall(r'\d+', update.message.text)
+    if not w: return WEIGHT
+    context.user_data['weight'] = float(w[0])
+    await update.message.reply_text("Ваш рост (см):")
     return HEIGHT
 
-async def c_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    nums = re.findall(r'\d+', update.message.text)
-    if not nums: return HEIGHT
-    context.user_data['height'] = float(nums[0])
-    await update.message.reply_text("Перечислите хронические заболевания или напишите 'Нет':")
+async def collect_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    h = re.findall(r'\d+', update.message.text)
+    if not h: return HEIGHT
+    context.user_data['height'] = float(h[0])
+    await update.message.reply_text("Есть ли у вас хронические заболевания? Если нет, напишите 'Нет'.")
     return DISEASES
 
-async def c_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['diseases'] = update.message.text
-    db.save_patient(update.effective_user.id, context.user_data)
-    await update.message.reply_text(
-        "✅ Медицинская карта сформирована. Теперь я учитываю ваши особенности при каждом ответе.",
-        reply_markup=get_main_kb()
-    )
+async def finalize_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    d = update.message.text
+    ud = context.user_data
+    
+    db_manage("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?)", 
+              (user_id, ud['gender'], ud['age'], ud['weight'], ud['height'], d))
+    
+    await update.message.reply_text("✅ Цифровая медкарта успешно сохранена.", reply_markup=main_kb())
     return CHAT_MODE
 
-async def doctor_consult(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     text = update.message.text
-    user = db.get_patient(update.effective_user.id)
     
-    if not user: return await start(update, context)
+    # Защита от потери данных
+    u_data = db_manage("SELECT * FROM users WHERE id=?", (user_id,), fetch=True)
+    if not u_data: return await start(update, context)
+    
+    profile = {"gender": u_data[1], "age": u_data[2], "weight": u_data[3], "height": u_data[4], "diseases": u_data[5]}
 
     if text == '📋 Моя карта':
-        await update.message.reply_text(f"📊 Данные: {user[1]}, {user[2]} лет, {user[3]}кг, {user[4]}см. Анамнез: {user[5]}")
-        return CHAT_MODE
-    
-    if text == '🆘 SOS':
-        await update.message.reply_text("🚨 Срочно свяжитесь со службой спасения: 103 или 112!")
-        return CHAT_MODE
-
-    await update.message.reply_chat_action("typing")
-    
-    prompt = (
-        f"КОНТЕКСТ ПАЦИЕНТА: Пол {user[1]}, Возраст {user[2]}, Вес {user[3]}кг, Рост {user[4]}см, "
-        f"Хронические болезни: {user[5]}. ЗАПРОС: {text}"
-    )
-    
-    answer = await ai_doctor.ask(prompt)
-    await update.message.reply_text(answer, parse_mode='Markdown')
+        await update.message.reply_text(f"📊 Текущие данные: {profile['gender']}, {profile['age']} лет, {profile['weight']}кг. Анамнез: {profile['diseases']}")
+    elif text == '🆘 SOS':
+        await update.message.reply_text("🚨 Экстренная помощь: 103 / 112")
+    else:
+        await update.message.reply_chat_action("typing")
+        response = await engine.generate_response(profile, text)
+        await update.message.reply_text(response, parse_mode='Markdown')
     return CHAT_MODE
 
-async def photo_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = db.get_patient(update.effective_user.id)
-    await update.message.reply_text("🔄 Обработка медицинского изображения... Пожалуйста, подождите.")
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    u_data = db_manage("SELECT * FROM users WHERE id=?", (user_id,), fetch=True)
+    profile = {"gender": u_data[1], "age": u_data[2], "weight": u_data[3], "height": u_data[4], "diseases": u_data[5]}
+
+    await update.message.reply_text("🔬 Провожу визуальный анализ...")
+    photo = await update.message.photo[-1].get_file()
+    img = Image.open(io.BytesIO(await photo.download_as_bytearray()))
     
-    file = await update.message.photo[-1].get_file()
-    img_byte = await file.download_as_bytearray()
-    img = Image.open(io.BytesIO(img_byte))
-    
-    prompt = f"Пациент ({user[2]} лет). Проведи визуальный анализ медицинского документа или симптома на фото."
-    answer = await ai_doctor.ask(prompt, img)
-    await update.message.reply_text(answer, parse_mode='Markdown')
+    response = await engine.generate_response(profile, "Проанализируй это медицинское изображение", img)
+    await update.message.reply_text(response, parse_mode='Markdown')
 
 def main():
+    init_system()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start), MessageHandler(filters.ALL, start)],
+    conv = ConversationHandler(
+        entry_points=[CommandHandler('start', start), MessageHandler(filters.ALL, start)],
         states={
-            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: collect_step(u, c, AGE, "Сколько вам полных лет?", "gender"))],
-            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_age)],
-            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_weight)],
-            HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_height)],
-            DISEASES: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_final)],
+            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_gender)],
+            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_age)],
+            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_weight)],
+            HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_height)],
+            DISEASES: [MessageHandler(filters.TEXT & ~filters.COMMAND, finalize_card)],
             CHAT_MODE: [
-                MessageHandler(filters.PHOTO, photo_analysis),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, doctor_consult)
+                MessageHandler(filters.PHOTO, handle_image),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main)
             ],
         },
-        fallbacks=[CommandHandler("start", start)],
-        allow_reentry=True
+        fallbacks=[CommandHandler('start', start)]
     )
-
-    app.add_handler(conv_handler)
-    logger.info("Бот запущен и готов к работе.")
+    
+    app.add_handler(conv)
     app.run_polling(drop_pending_updates=True)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
