@@ -1,8 +1,6 @@
+# config.py — совместимость со старым кодом
 import os
-from dotenv import load_dotenv
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-DATABASE_PATH = "health_bot.db"
-CLAUDE_MODEL = "claude-opus-4-5"
-MAX_TOKENS = 2048
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+DATABASE_PATH = "medical_bot.db"
