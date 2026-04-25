@@ -31,70 +31,93 @@ SETTING_AGE, SETTING_GENDER = range(2)
 
 MAIN_KB = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("Вес"), KeyboardButton("Питание")],
-        [KeyboardButton("Активность"), KeyboardButton("Анализы")],
-        [KeyboardButton("Оценка здоровья"), KeyboardButton("План обследований")],
+        [KeyboardButton("Моё здоровье"), KeyboardButton("Добавить данные")],
+        [KeyboardButton("Мои анализы"), KeyboardButton("План обследований")],
         [KeyboardButton("Мой профиль"), KeyboardButton("История")],
     ],
     resize_keyboard=True,
 )
 
 
+def get_user_context(user_id):
+    user_info = get_user_info(user_id)
+    records = get_health_records(user_id, limit=50)
+    history = get_conversation_history(user_id, limit=30)
+    return user_info, records, history
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id, user.username, user.first_name)
-    text = (
-        "Здравствуйте, " + user.first_name + "!\n\n"
-        "Я ваш личный ИИ-доктор. Могу помочь:\n\n"
-        "Отслеживать вес, питание, активность\n"
-        "Расшифровывать медицинские анализы по фото\n"
-        "Составить план обследований\n"
-        "Оценить ваше здоровье по шкале 1-10\n\n"
-        "Важно: я ИИ-ассистент и не заменяю настоящего врача."
-    )
+    user_info = get_user_info(user.id)
+
+    if user_info and user_info["age"]:
+        text = (
+            "С возвращением, " + user.first_name + "!\n\n"
+            "Я помню вашу историю здоровья и готов продолжить работу. "
+            "Расскажите, как вы себя чувствуете, или выберите действие в меню."
+        )
+    else:
+        text = (
+            "Здравствуйте, " + user.first_name + "!\n\n"
+            "Я ваш персональный ИИ-врач. Я буду следить за вашим здоровьем, "
+            "анализировать показатели и давать персональные рекомендации.\n\n"
+            "Чтобы начать, расскажите немного о себе — сколько вам лет? "
+            "Это поможет мне давать точные рекомендации."
+        )
     await update.message.reply_text(text, reply_markup=MAIN_KB)
 
 
-async def handle_health_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_my_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    records = get_health_records(user_id, limit=20)
-    history = get_conversation_history(user_id, limit=10)
-    user_info = get_user_info(user_id)
-    records_text = ""
-    for r in records[:10]:
-        records_text += "- " + r["record_type"] + ": " + r["value"] + "\n"
-    msgs = [
-        {"role": m["role"], "content": m["content"]}
-        for m in history[-6:]
-    ]
+    user_info, records, history = get_user_context(user_id)
+
+    msgs = [{"role": m["role"], "content": m["content"]} for m in history[-10:]]
     msgs.append({
         "role": "user",
-        "content": "Оцени моё здоровье по шкале 1-10 на основе данных:\n" + (records_text or "Данных пока нет"),
+        "content": (
+            "Дай мне общую оценку моего здоровья на основе всех имеющихся данных. "
+            "Отметь динамику, что улучшилось, что требует внимания, "
+            "и задай вопрос о том, что ещё важно знать для полной картины."
+        ),
     })
-    response = chat_with_claude(msgs, user_info)
+    response = chat_with_claude(msgs, user_info, records)
+    save_conversation(user_id, "user", "Запрос оценки здоровья")
+    save_conversation(user_id, "assistant", response)
     await update.message.reply_text(response, reply_markup=MAIN_KB)
+
+
+async def handle_add_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Что хотите записать? Просто напишите в свободной форме, например:\n\n"
+        "- Вес 74 кг\n"
+        "- Сегодня бегал 30 минут\n"
+        "- На завтрак овсянка и кофе\n"
+        "- Болит голова с утра\n"
+        "- Давление 130/85\n\n"
+        "Я запишу данные и прокомментирую их с учётом вашей истории."
+    )
+    context.user_data["mode"] = "add_data"
+
+
+async def handle_show_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Отправьте фото анализа или медицинского документа.\n"
+        "Я расшифрую показатели и объясню что они означают для вашего здоровья."
+    )
 
 
 async def handle_screening_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_info = get_user_info(user_id)
-    if not user_info or not user_info["age"] or not user_info["gender"]:
-        await update.message.reply_text(
-            "Для составления плана укажите возраст и пол.\n"
-            "Используйте команды /setage и /setgender"
-        )
-        return
-    msgs = [{
+    user_info, records, history = get_user_context(user_id)
+
+    msgs = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+    msgs.append({
         "role": "user",
-        "content": (
-            "Составь план обследований для человека: возраст "
-            + str(user_info["age"])
-            + " лет, пол: "
-            + str(user_info["gender"])
-        ),
-    }]
-    response = chat_with_claude(msgs, user_info)
-    save_conversation(user_id, "user", "План обследований")
+        "content": "Составь для меня персональный план обследований и профилактики на этот год.",
+    })
+    response = chat_with_claude(msgs, user_info, records)
+    save_conversation(user_id, "user", "Запрос плана обследований")
     save_conversation(user_id, "assistant", response)
     await update.message.reply_text(response, reply_markup=MAIN_KB)
 
@@ -102,23 +125,35 @@ async def handle_screening_plan(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     u = get_user_info(user_id)
+    records = get_health_records(user_id, limit=100)
+
+    weight_records = [r for r in records if "вес" in r["record_type"].lower()]
+    last_weight = weight_records[0]["value"] if weight_records else "не указан"
+
     text = (
         "Ваш профиль:\n\n"
         "Имя: " + (u["first_name"] if u else "Неизвестно") + "\n"
         "Возраст: " + str(u["age"] if u and u["age"] else "Не указан") + "\n"
-        "Пол: " + str(u["gender"] if u and u["gender"] else "Не указан") + "\n\n"
-        "Для обновления используйте /setage и /setgender"
+        "Пол: " + str(u["gender"] if u and u["gender"] else "Не указан") + "\n"
+        "Последний вес: " + last_weight + "\n"
+        "Всего записей: " + str(len(records)) + "\n\n"
+        "Для обновления возраста: /setage\n"
+        "Для обновления пола: /setgender"
     )
     await update.message.reply_text(text, reply_markup=MAIN_KB)
 
 
 async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    records = get_health_records(user_id, limit=10)
+    records = get_health_records(user_id, limit=15)
     if not records:
-        await update.message.reply_text("Записей пока нет.", reply_markup=MAIN_KB)
+        await update.message.reply_text(
+            "Записей пока нет. Начните вести дневник здоровья — "
+            "просто напишите мне о своём самочувствии, весе или активности.",
+            reply_markup=MAIN_KB,
+        )
         return
-    text = "Ваши последние записи:\n\n"
+    text = "Последние записи:\n\n"
     for r in records:
         text += str(r["recorded_at"])[:10] + " - " + r["record_type"] + ": " + r["value"] + "\n"
     await update.message.reply_text(text, reply_markup=MAIN_KB)
@@ -170,15 +205,21 @@ async def receive_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Анализирую изображение, подождите...")
+    await update.message.reply_text("Анализирую документ, подождите...")
+    user_id = update.effective_user.id
+    user_info, records, _ = get_user_context(user_id)
+
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     image_bytes = await file.download_as_bytearray()
     caption = update.message.caption or ""
+
     try:
-        response = analyze_medical_image(bytes(image_bytes), "jpeg", caption)
-        save_conversation(update.effective_user.id, "user", "[Фото анализа]")
-        save_conversation(update.effective_user.id, "assistant", response)
+        response = analyze_medical_image(
+            bytes(image_bytes), "jpeg", caption, user_info, records
+        )
+        save_conversation(user_id, "user", "[Фото медицинского документа] " + caption)
+        save_conversation(user_id, "assistant", response)
         await update.message.reply_text(response, reply_markup=MAIN_KB)
     except Exception as e:
         logger.error("Image error: " + str(e))
@@ -188,62 +229,58 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def detect_health_data(text):
+    tl = text.lower()
+    if any(w in tl for w in ["кг", "вешу", "вес ", "весом"]):
+        return "вес"
+    if any(w in tl for w in ["завтрак", "обед", "ужин", "съел", "поел", "питание", "калор"]):
+        return "питание"
+    if any(w in tl for w in ["бегал", "тренировк", "спортзал", "ходил", "шагов", "физ", "активност"]):
+        return "активность"
+    if any(w in tl for w in ["давление", "пульс", "температур", "сахар", "глюкоз"]):
+        return "показатели"
+    if any(w in tl for w in ["болит", "боль", "плохо", "симптом", "тошнит", "кружится"]):
+        return "симптомы"
+    if any(w in tl for w in ["сплю", "сон", "не сплю", "бессонниц", "устал"]):
+        return "сон"
+    return None
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
-    user_info = get_user_info(user_id)
     tl = text.lower().strip()
+    user_info, records, history = get_user_context(user_id)
 
-    if "вес" in tl:
-        await update.message.reply_text("Введите ваш вес в кг (например: 70.5):")
-        context.user_data["expecting"] = "вес"
+    if tl in ["моё здоровье", "мое здоровье"]:
+        await handle_my_health(update, context)
         return
-    if "питание" in tl:
-        await update.message.reply_text("Опишите что вы сегодня ели:")
-        context.user_data["expecting"] = "питание"
+    if tl == "добавить данные":
+        await handle_add_data(update, context)
         return
-    if "активность" in tl:
-        await update.message.reply_text("Опишите вашу физическую активность:")
-        context.user_data["expecting"] = "активность"
+    if tl == "мои анализы":
+        await handle_show_analysis(update, context)
         return
-    if "анализ" in tl:
-        await update.message.reply_text("Отправьте фото результата анализа.")
-        return
-    if "оценка" in tl:
-        await handle_health_score(update, context)
-        return
-    if "план" in tl:
+    if tl == "план обследований":
         await handle_screening_plan(update, context)
         return
-    if "профиль" in tl:
+    if tl == "мой профиль":
         await handle_profile(update, context)
         return
-    if "история" in tl:
+    if tl == "история":
         await handle_history(update, context)
         return
 
-    expecting = context.user_data.get("expecting")
-    if expecting in ["вес", "питание", "активность"]:
-        save_health_record(user_id, expecting, text)
-        context.user_data.pop("expecting", None)
-        history = get_conversation_history(user_id, limit=10)
-        msgs = [{"role": m["role"], "content": m["content"]} for m in history]
-        msgs.append({
-            "role": "user",
-            "content": "Я записал " + expecting + ": " + text + ". Прокомментируй кратко.",
-        })
-        response = chat_with_claude(msgs, user_info)
-        save_conversation(user_id, "user", expecting + ": " + text)
-        save_conversation(user_id, "assistant", response)
-        await update.message.reply_text(response, reply_markup=MAIN_KB)
-        return
+    record_type = detect_health_data(text)
+    if record_type:
+        save_health_record(user_id, record_type, text[:500])
 
-    history = get_conversation_history(user_id, limit=20)
-    msgs = [{"role": m["role"], "content": m["content"]} for m in history]
+    msgs = [{"role": m["role"], "content": m["content"]} for m in history[-20:]]
     msgs.append({"role": "user", "content": text})
     save_conversation(user_id, "user", text)
+
     try:
-        response = chat_with_claude(msgs, user_info)
+        response = chat_with_claude(msgs, user_info, records)
         save_conversation(user_id, "assistant", response)
         await update.message.reply_text(response, reply_markup=MAIN_KB)
     except Exception as e:
@@ -257,6 +294,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     age_conv = ConversationHandler(
         entry_points=[CommandHandler("setage", set_age)],
         states={SETTING_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_age)]},
@@ -267,12 +305,14 @@ def main():
         states={SETTING_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_gender)]},
         fallbacks=[],
     )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", handle_profile))
     app.add_handler(age_conv)
     app.add_handler(gender_conv)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     logger.info("Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
