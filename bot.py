@@ -1,40 +1,38 @@
-import logging
 import os
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import database
 from gemini_client import GeminiClient
 
-logging.basicConfig(level=logging.INFO)
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот перезагружен и готов к работе. Пришлите текст или фото анализов.")
+    database.init_db()
+    reply_keyboard = [['📊 Мое здоровье', '📝 Заполнить анкету'], ['📅 План чекапа', '📉 График веса']]
+    await update.message.reply_text(
+        "Здравствуйте! Я ваш персональный терапевт. Нам нужно настроить ваш профиль для точных рекомендаций.",
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
+    )
 
-async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
     user_id = update.effective_user.id
+
+    # Простая логика сохранения данных из текста (парсинг возраста/пола)
+    if "мне" in text.lower() and "лет" in text.lower():
+        # Пример: "Мне 39 лет, я мужчина" -> извлекаем 39 и муж
+        import re
+        age = re.search(r'\d+', text)
+        if age:
+            database.save_user(user_id, age=int(age.group()))
+            await update.message.reply_text("✅ Возраст сохранен в вашу карту.")
     
-    # Если это фото
-    if update.message.photo:
-        photo_file = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-        response = await GeminiClient.ask(None, user_id, bytes(photo_bytes))
-    # Если это текст
-    else:
-        response = await GeminiClient.ask(update.message.text, user_id)
-    
+    response = await GeminiClient.ask(text, user_id)
     await update.message.reply_text(response)
 
 def main():
-    token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        print("Ошибка: TELEGRAM_TOKEN не найден!")
-        return
-
-    app = Application.builder().token(token).build()
-    
+    app = Application.builder().token(os.getenv("TELEGRAM_TOKEN")).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_all))
-    
-    print("Бот запущен...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_message)) # Добавьте обработку фото
     app.run_polling()
 
 if __name__ == "__main__":
