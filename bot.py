@@ -16,12 +16,11 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 DB_PATH = "/tmp/medical_bot.db"
 
-# 1. ФУНКЦИЯ АВТОПОДБОРА МОДЕЛИ (решает проблему 404 навсегда)
+# 1. ФУНКЦИЯ АВТОПОДБОРА МОДЕЛИ
 def setup_ai():
     try:
         genai.configure(api_key=GEMINI_KEY)
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Пробуем найти лучшую из доступных
         priority = ['models/gemini-1.5-flash', 'models/gemini-1.5-flash-latest', 'models/gemini-pro']
         for p in priority:
             if p in models:
@@ -34,19 +33,19 @@ def setup_ai():
 
 ai_model = setup_ai()
 
-# 2. РАБОТА С ДАННЫМИ
+# 2. РАБОТА С ДАННЫМИ (БЕЗОПАСНАЯ)
 def get_context(uid):
     try:
         conn = sqlite3.connect(DB_PATH)
         res = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         conn.close()
         if res:
-            return f"Данные пациента: {res[1]}, возраст {res[2]}, болезни: {res[3]}, лекарства: {res[4]}."
+            return f"Данные пациента: пол {res[1]}, возраст {res[2]}, болезни: {res[3]}, лекарства: {res[4]}."
     except: pass
-    return "Данные анкеты отсутствуют. Напомни пользователю заполнить её."
+    return "ДАННЫЕ АНКЕТЫ ОТСУТСТВУЮТ."
 
 async def save_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Формат: /anketa Муж 30 Гастрит Омез
+    # Команда /anketa остается для ручного ввода: /anketa Муж 30 Гастрит Омез
     u = update.effective_user.id
     d = context.args
     if len(d) < 4:
@@ -58,19 +57,32 @@ async def save_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text("✅ Анкета сохранена!")
 
-# 3. ОБРАБОТКА ТЕКСТА И ФОТО
+# 3. ОБРАБОТКА ТЕКСТА И ФОТО + АВТО-ОПРОС
 async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ai_model:
         await update.message.reply_text("ИИ не инициализирован.")
         return
 
+    uid = update.effective_user.id
+    user_context = get_context(uid)
+    
+    # ЖЕСТКАЯ ИНСТРУКЦИЯ ДЛЯ ИИ
+    if user_context == "ДАННЫЕ АНКЕТЫ ОТСУТСТВУЮТ.":
+        instruction = (
+            "Ты — персональный медицинский ассистент. У тебя НЕТ данных о пациенте.\n"
+            "ТВОЯ ЗАДАЧА: Проведи опрос прямо в чате. Спрашивай по одному пункту: "
+            "1. Пол и возраст. 2. Рост и вес. 3. Хронические заболевания. 4. Лекарства.\n"
+            "ЗАПРЕЩЕНО говорить про личные кабинеты или ссылки. Ты сам — анкета."
+        )
+    else:
+        instruction = f"Ты — медицинский ассистент. Используй эти данные: {user_context}"
+
     content = [
-        "Ты — персональный медицинский ассистент. Используй данные пациента ниже для анализа.\n",
-        f"КОНТЕКСТ: {get_context(update.effective_user.id)}\n",
-        f"ЗАПРОС: {update.message.text or update.message.caption or 'Проанализируй это'}"
+        f"СИСТЕМНАЯ РОЛЬ: {instruction}\n",
+        f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {update.message.text or update.message.caption or 'Проанализируй'}"
     ]
 
-    # Если прислали фото (анализы или симптомы)
+    # Добавляем фото, если есть
     if update.message.photo:
         await update.message.reply_chat_action(ChatAction.TYPING)
         file = await update.message.photo[-1].get_file()
@@ -80,12 +92,12 @@ async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_chat_action(ChatAction.TYPING)
     try:
         response = ai_model.generate_content(content)
-        # Отправка длинных сообщений
         text = response.text
+        # Нарезка длинных сообщений
         for i in range(0, len(text), 4000):
             await update.message.reply_text(text[i:i+4000])
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
+        await update.message.reply_text(f"⚠️ Ошибка ИИ: {str(e)}")
 
 def main():
     conn = sqlite3.connect(DB_PATH)
@@ -95,6 +107,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("anketa", save_anketa))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_all))
+    
+    # Важно: убираем drop_pending_updates, чтобы не терять сообщения
     app.run_polling()
 
 if __name__ == '__main__':
