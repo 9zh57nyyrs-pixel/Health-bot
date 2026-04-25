@@ -3,16 +3,14 @@ import google.generativeai as genai
 from telegram import Update, ReplyKeyboardMarkup, constants
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Настройка логирования для Railway
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Настройка ИИ
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Используем папку /tmp, так как Railway часто запрещает запись в корень
-DB_PATH = "/tmp/health_v5.db"
+# Путь для базы данных (используем /tmp для стабильности на Railway)
+DB_PATH = "/tmp/medical_v6.db"
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -23,62 +21,67 @@ def get_user_profile(uid):
         res = conn.execute("SELECT profile FROM users WHERE id=?", (uid,)).fetchone()
         return res[0] if res else None
 
+# Главное меню
+MAIN_KBD = ReplyKeyboardMarkup([
+    ['🩺 Задать вопрос', '📋 Моя карта'],
+    ['🆘 SOS (103/112)', '⚙️ Сбросить данные']
+], resize_keyboard=True)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
     uid = update.effective_user.id
     profile = get_user_profile(uid)
     
     if profile:
-        await update.message.reply_text(f"✅ Карта активна: {profile}\n\nЧто вас беспокоит?")
+        await update.message.reply_text("✅ Вы в главном меню ассистента.", reply_markup=MAIN_KBD)
     else:
         await update.message.reply_text(
-            "Добро пожаловать! Напишите ваш пол, возраст, вес и болезни одним сообщением через запятую.\n"
-            "Пример: Мужчина, 30 лет, 80 кг, нет болезней."
+            "Здравствуйте! Чтобы я мог давать точные советы, введите через запятую: "
+            "Пол, Возраст, Вес, Хронические заболевания.\n\n"
+            "Пример: Мужчина, 40 лет, 90 кг, гипертония."
         )
 
-async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
     profile = get_user_profile(uid)
 
-    # Если профиля нет — сохраняем первое сообщение как профиль
+    # 1. Регистрация, если профиля нет
     if not profile:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("INSERT INTO users (id, profile) VALUES (?, ?)", (uid, text))
-        await update.message.reply_text("✅ Данные сохранены! Теперь задавайте любые медицинские вопросы.")
+        await update.message.reply_text("✅ Данные сохранены! Пользуйтесь меню:", reply_markup=MAIN_KBD)
         return
 
-    # Если профиль есть — работаем как консультант
+    # 2. Обработка кнопок меню
+    if text == '📋 Моя карта':
+        await update.message.reply_text(f"📊 Ваши данные:\n{profile}", reply_markup=MAIN_KBD)
+        return
+    
+    if text == '🆘 SOS (103/112)':
+        await update.message.reply_text("🚨 Срочно звоните 103 или 112!", reply_markup=MAIN_KBD)
+        return
+
+    if text == '⚙️ Сбросить данные':
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        await update.message.reply_text("🗑 Данные удалены. Нажмите /start для новой записи.")
+        return
+
+    # 3. Консультация через ИИ
     await update.message.reply_chat_action(constants.ChatAction.TYPING)
     try:
-        # Формируем запрос к ИИ
-        prompt = f"Пациент: {profile}. Вопрос: {text}. Ответь как квалифицированный врач."
-        
-        # Если прислали фото анализов
-        if update.message.photo:
-            photo_file = await update.message.photo[-1].get_file()
-            img_data = await photo_file.download_as_bytearray()
-            # Для простоты в этой версии обрабатываем только текст, 
-            # чтобы избежать падений из-за памяти на Railway
-            prompt += " (К сообщению было приложено фото)"
-
+        prompt = f"Контекст: {profile}. Вопрос пациента: {text}. Ответь как врач."
         response = await asyncio.to_thread(model.generate_content, prompt)
-        await update.message.reply_text(response.text, parse_mode='Markdown')
+        await update.message.reply_text(response.text, parse_mode='Markdown', reply_markup=MAIN_KBD)
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await update.message.reply_text("🩺 Ошибка связи с ИИ. Попробуйте написать вопрос короче.")
+        logger.error(f"AI Error: {e}")
+        await update.message.reply_text("❌ Ошибка связи. Попробуйте через минуту (возможно, лимит запросов).")
 
 def main():
-    token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        logger.error("Нет токена!")
-        return
-        
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(os.getenv("TELEGRAM_TOKEN")).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_all))
-    
-    logger.info("Бот запущен...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
 if __name__ == '__main__':
