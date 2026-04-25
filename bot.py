@@ -7,88 +7,98 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Логирование
+# --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-logger = logging.getLogger(__name__)
-
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 DB_PATH = "/tmp/medical_bot.db"
 
-# 1. Поиск работающей модели (чтобы не было 404)
-def get_ai_model():
-    try:
-        genai.configure(api_key=GEMINI_KEY)
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        name = 'models/gemini-1.5-flash' if 'models/gemini-1.5-flash' in models else models[0]
-        return genai.GenerativeModel(name)
-    except Exception as e:
-        print(f"Ошибка ИИ: {e}")
-        return None
+# Инициализация ИИ
+genai.configure(api_key=GEMINI_KEY)
+# Используем flash для скорости или pro для точности
+model = genai.GenerativeModel('gemini-1.5-flash') 
 
-model = get_ai_model()
-
-# 2. Получение данных из анкеты
-def get_user_data(user_id):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        res = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        conn.close()
-        if res:
-            # Превращаем данные в понятный для ИИ текст
-            return f"Пациент: пол {res[1]}, возраст {res[2]}, вес {res[3]}кг, рост {res[4]}см. Хронические болезни: {res[5]}."
-    except Exception as e:
-        logger.error(f"Ошибка БД: {e}")
-    return "Данные анкеты отсутствуют. Попроси пользователя их предоставить."
-
-# 3. Отправка длинных сообщений (чтобы не было "Message is too long")
-async def send_response(update, text):
-    if len(text) <= 4000:
-        try:
-            await update.message.reply_text(text, parse_mode='Markdown')
-        except:
-            await update.message.reply_text(text)
-    else:
-        for i in range(0, len(text), 4000):
-            await update.message.reply_text(text[i:i+4000])
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Связь установлена. Я вижу твою анкету и готов давать рекомендации.")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not model:
-        await update.message.reply_text("❌ Ошибка ИИ.")
-        return
-
-    user_id = update.effective_user.id
-    user_info = get_user_data(user_id)
-    
-    # ФОРМИРУЕМ ПРОВЕРЕННЫЙ ПРОМПТ
-    prompt = (
-        f"ИНСТРУКЦИЯ: Ты — профессиональный медицинский ассистент. "
-        f"Твои ответы должны основываться НА ДАННЫХ ПАЦИЕНТА ниже.\n\n"
-        f"ДАННЫЕ ИЗ АНКЕТЫ: {user_info}\n\n"
-        f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {update.message.text}\n\n"
-        f"ОТВЕТ: Дай конкретные рекомендации. Не пиши общих фраз о том, что ты ничего не знаешь."
-    )
-
-    await update.message.reply_chat_action(ChatAction.TYPING)
-    try:
-        response = model.generate_content(prompt)
-        await send_response(update, response.text)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
-
-def main():
-    # Создаем таблицу, если её нет
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+def init_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, gender TEXT, age TEXT, weight TEXT, height TEXT, ill TEXT)")
+    conn.execute('''CREATE TABLE IF NOT EXISTS users 
+                    (id INTEGER PRIMARY KEY, gender TEXT, age TEXT, 
+                     history TEXT, meds TEXT, allergies TEXT)''')
     conn.close()
 
+def save_user(uid, gender, age, history, meds, allergies):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?)", 
+                 (uid, gender, age, history, meds, allergies))
+    conn.commit()
+    conn.close()
+
+def get_user(uid):
+    conn = sqlite3.connect(DB_PATH)
+    res = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    conn.close()
+    if res:
+        return f"Пациент: {res[1]}, {res[2]} лет. Анамнез: {res[3]}. Лекарства: {res[4]}. Аллергии: {res[5]}."
+    return None
+
+# --- ЛОГИКА БОТА ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Здравствуйте! Я ваш медицинский ассистент.\n\n"
+        "Чтобы я мог давать точные рекомендации, заполните анкету командой:\n"
+        "/anketa [Пол] [Возраст] [Болезни] [Лекарства] [Аллергии]\n\n"
+        "Пример:\n/anketa Муж 35 Гастрит Омез Нет"
+    )
+
+async def set_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # Упрощенный парсинг для примера
+        args = context.args
+        if len(args) < 5:
+            await update.message.reply_text("Ошибка! Введите: /anketa Пол Возраст Болезни Лекарства Аллергии")
+            return
+        
+        save_user(update.effective_user.id, args[0], args[1], args[2], args[3], args[4])
+        await update.message.reply_text("✅ Данные сохранены! Теперь можете задавать вопросы.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка сохранения: {e}")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_data = get_user(user_id)
+    user_query = update.message.text
+
+    # Формируем инструкцию для ИИ
+    system_prompt = (
+        "Ты — высококвалифицированный медицинский ассистент. Твоя задача — помогать пользователю анализировать симптомы "
+        "и давать рекомендации по следующим шагам (к какому врачу пойти, какие уточняющие вопросы себе задать).\n"
+        "ВАЖНО: Всегда добавляй дисклеймер, что ты не заменяешь врача.\n\n"
+    )
+    
+    if user_data:
+        full_prompt = f"{system_prompt} КОНТЕКСТ ПАЦИЕНТА: {user_data}\n\n ВОПРОС: {user_query}"
+    else:
+        full_prompt = f"{system_prompt} (Данных о пациенте нет, попроси его заполнить анкету если это важно).\n\n ВОПРОС: {user_query}"
+
+    await update.message.reply_chat_action(ChatAction.TYPING)
+    
+    try:
+        response = model.generate_content(full_prompt)
+        # Если ответ слишком длинный, режем его (защита от ошибки Message too long)
+        text = response.text
+        for i in range(0, len(text), 4000):
+            await update.message.reply_text(text[i:i+4000])
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка ИИ: {e}")
+
+# --- ЗАПУСК ---
+def main():
+    init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("anketa", set_anketa))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
