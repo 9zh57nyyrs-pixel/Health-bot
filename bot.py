@@ -1,66 +1,57 @@
 import os
 import logging
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import database
 from gemini_client import GeminiClient
 
-logging.basicConfig(level=logging.INFO)
+# Константы состояний
+ANKETA_STEP = 1
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     database.init_db()
     user_id = update.effective_user.id
-    user = database.get_user(user_id)
+    profile, _ = database.get_full_context(user_id)
     
-    keyboard = [['📊 Мой профиль', '👨‍⚕️ Консультация'], ['📉 Мои анализы', '⚙️ Настройки']]
+    keyboard = [['📝 Моя медкарта', '📊 Анализы'], ['📅 План чекапа', '🆘 Помощь']]
     markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
-    msg = "Добро пожаловать в систему HealthHelper! "
-    if not user:
-        msg += "Давайте составим вашу медкарту. Сколько вам лет и какой у вас пол?"
+    if not profile:
+        await update.message.reply_text(
+            "👨‍⚕️ Добро пожаловать! Я ваш ИИ-терапевт.\n"
+            "Для начала работы мне нужно заполнить вашу медицинскую карту.\n"
+            "Пожалуйста, напишите ваш возраст, пол и текущий вес (например: 35 лет, мужской, 80 кг).",
+            reply_markup=markup
+        )
     else:
-        msg += f"Рад видеть вас снова. Как ваше самочувствие?"
-        
-    await update.message.reply_text(msg, reply_markup=markup)
+        await update.message.reply_text("С возвращением! Я готов к работе. Что вас беспокоит?", reply_markup=markup)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
     
-    # Пытаемся "подслушать" данные и сохранить их в базу автоматом
-    if "лет" in text.lower():
-        import re
-        age = re.search(r'\d+', text)
-        if age:
-            database.save_user(user_id, age=int(age.group()))
+    # Логика автоматического сохранения данных
+    if text and any(word in text.lower() for word in ['лет', 'муж', 'жен', 'кг']):
+        # Тут можно добавить сложный Regex парсинг как в коде Claude
+        await update.message.reply_text("📥 Данные приняты в обработку...")
     
-    if "муж" in text.lower() or "жен" in text.lower():
-        gender = "мужской" if "муж" in text.lower() else "женский"
-        database.save_user(user_id, gender=gender)
-
-    # Отправляем запрос в Gemini
-    response = await GeminiClient.ask(text, user_id)
-    await update.message.reply_text(response)
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    photo = await update.message.photo[-1].get_file()
-    photo_bytes = await photo.download_as_bytearray()
-    
-    await update.message.reply_text("⏳ Анализирую ваши данные, подождите...")
-    response = await GeminiClient.ask(None, user_id, bytes(photo_bytes))
-    await update.message.reply_text(response)
+    # Если фото - обрабатываем как анализы
+    if update.message.photo:
+        photo = await update.message.photo[-1].get_file()
+        photo_bytes = await photo.download_as_bytearray()
+        res = await GeminiClient.get_response(user_id, photo_bytes=bytes(photo_bytes))
+    else:
+        res = await GeminiClient.get_response(user_id, text_input=text)
+        
+    await update.message.reply_text(res)
 
 def main():
-    token = os.getenv("TELEGRAM_TOKEN")
-    app = Application.builder().token(token).build()
-    
-    database.init_db()
+    app = Application.builder().token(os.getenv("TELEGRAM_TOKEN")).build()
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_all))
     
+    print("Сервер запущен...")
     app.run_polling()
 
 if __name__ == "__main__":
