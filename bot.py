@@ -1,201 +1,165 @@
 import os
-
 import sys
-
-import sqlite3
-
 import logging
-
+import psycopg2
+import psycopg2.extras
 import google.generativeai as genai
-
-from telegram import Update
-
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, ConversationHandler
+)
 
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-
-
-# Логирование
-
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-
+# ─── Логирование ───────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-
-
-# Переменные
-
+# ─── Переменные окружения ───────────────────────────────────────────────────────
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-DB_PATH = "/tmp/medical_bot.db"
+# ─── Шаги анкеты ───────────────────────────────────────────────────────────────
+GENDER, AGE, DISEASES, MEDS = range(4)
+MAX_HISTORY = 10
 
-
-
-# 1. ФУНКЦИЯ АВТОПОДБОРА МОДЕЛИ (решает проблему 404 навсегда)
 
 def setup_ai():
-
     try:
-
         genai.configure(api_key=GEMINI_KEY)
-
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-
-        # Пробуем найти лучшую из доступных
-
-        priority = ['models/gemini-1.5-flash', 'models/gemini-1.5-flash-latest', 'models/gemini-pro']
-
+        models = [
+            m.name for m in genai.list_models()
+            if "generateContent" in m.supported_generation_methods
+        ]
+        priority = [
+            "models/gemini-1.5-flash",
+            "models/gemini-1.5-flash-latest",
+            "models/gemini-pro",
+        ]
         for p in priority:
-
             if p in models:
-
                 logger.info(f"Выбрана модель: {p}")
-
                 return genai.GenerativeModel(p)
-
-        return genai.GenerativeModel(models[0]) if models else None
-
-    except Exception as e:
-
-        logger.error(f"Ошибка ИИ: {e}")
-
+        if models:
+            logger.info(f"Используем первую доступную модель: {models[0]}")
+            return genai.GenerativeModel(models[0])
+        logger.error("Нет доступных моделей Gemini")
         return None
-
+    except Exception as e:
+        logger.error(f"Ошибка инициализации ИИ: {e}")
+        return None
 
 
 ai_model = setup_ai()
 
 
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("Переменная DATABASE_URL не задана!")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
-# 2. РАБОТА С ДАННЫМИ
 
-def get_context(uid):
-
+def init_db():
     try:
-
-        conn = sqlite3.connect(DB_PATH)
-
-        res = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-
-        conn.close()
-
-        if res:
-
-            return f"Данные пациента: {res[1]}, возраст {res[2]}, болезни: {res[3]}, лекарства: {res[4]}."
-
-    except: pass
-
-    return "Данные анкеты отсутствуют. Напомни пользователю заполнить её."
-
-
-
-async def save_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    # Формат: /anketa Муж 30 Гастрит Омез
-
-    u = update.effective_user.id
-
-    d = context.args
-
-    if len(d) < 4:
-
-        await update.message.reply_text("Используй: /anketa Пол Возраст Болезни Лекарства")
-
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-
-    conn.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?)", (u, d[0], d[1], d[2], d[3], "Нет"))
-
-    conn.commit()
-
-    conn.close()
-
-    await update.message.reply_text("✅ Анкета сохранена!")
-
-
-
-# 3. ОБРАБОТКА ТЕКСТА И ФОТО
-
-async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not ai_model:
-
-        await update.message.reply_text("ИИ не инициализирован.")
-
-        return
-
-
-
-    content = [
-
-        "Ты — персональный медицинский ассистент. Используй данные пациента ниже для анализа.\n",
-
-        f"КОНТЕКСТ: {get_context(update.effective_user.id)}\n",
-
-        f"ЗАПРОС: {update.message.text or update.message.caption or 'Проанализируй это'}"
-
-    ]
-
-
-
-    # Если прислали фото (анализы или симптомы)
-
-    if update.message.photo:
-
-        await update.message.reply_chat_action(ChatAction.TYPING)
-
-        file = await update.message.photo[-1].get_file()
-
-        img_bytes = await file.download_as_bytearray()
-
-        content.append({"mime_type": "image/jpeg", "data": bytes(img_bytes)})
-
-
-
-    await update.message.reply_chat_action(ChatAction.TYPING)
-
-    try:
-
-        response = ai_model.generate_content(content)
-
-        # Отправка длинных сообщений
-
-        text = response.text
-
-        for i in range(0, len(text), 4000):
-
-            await update.message.reply_text(text[i:i+4000])
-
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id      BIGINT PRIMARY KEY,
+                        gender  TEXT,
+                        age     INTEGER,
+                        diseases TEXT,
+                        meds    TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS history (
+                        id      SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        role    TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+        logger.info("База данных инициализирована")
     except Exception as e:
-
-        await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
-
-
-
-def main():
-
-    conn = sqlite3.connect(DB_PATH)
-
-    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, g TEXT, a TEXT, h TEXT, m TEXT, al TEXT)")
-
-    conn.close()
+        logger.error(f"Ошибка инициализации БД: {e}")
+        raise
 
 
+def get_patient_context(uid: int) -> str:
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
+                row = cur.fetchone()
+        if row:
+            return (
+                f"Пол: {row['gender']}, возраст: {row['age']}, "
+                f"хронические заболевания: {row['diseases']}, "
+                f"принимаемые лекарства: {row['meds']}."
+            )
+    except Exception as e:
+        logger.error(f"Ошибка чтения данных пациента (uid={uid}): {e}")
+    return "Данные анкеты отсутствуют. Напомни пользователю заполнить её командой /anketa."
 
-    app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("anketa", save_anketa))
+def save_patient(uid: int, gender: str, age: int, diseases: str, meds: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (id, gender, age, diseases, meds)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET gender=%s, age=%s, diseases=%s, meds=%s
+            """, (uid, gender, age, diseases, meds,
+                  gender, age, diseases, meds))
 
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_all))
 
-    app.run_polling()
+def load_history(uid: int) -> list[dict]:
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT role, message FROM history
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (uid, MAX_HISTORY))
+                rows = cur.fetchall()
+        return list(reversed(rows))
+    except Exception as e:
+        logger.error(f"Ошибка загрузки истории (uid={uid}): {e}")
+        return []
 
 
+def append_history(uid: int, role: str, message: str):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO history (user_id, role, message) VALUES (%s, %s, %s)",
+                    (uid, role, message)
+                )
+    except Exception as e:
+        logger.error(f"Ошибка записи истории (uid={uid}): {e}")
 
-if __name__ == '__main__':
 
-    main() 
+def clear_history(uid: int):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM history WHERE user_id = %s", (uid,))
+    except Exception as e:
+        logger.error(f"Ошибка очистки истории (uid={uid}): {e}")
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_user.first_name or "друг"
+    await update.message.reply_text(
+        f"👋 Привет, {name}!\n\n"
+        "Я — твой персональный медицинский ассистент на базе ИИ.\n\n"
+        "Что я умею:\n"
+        "• От
