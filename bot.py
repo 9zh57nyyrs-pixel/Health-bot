@@ -269,22 +269,14 @@ async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text or update.message.caption or "Проанализируй изображение"
     await update.message.reply_chat_action(ChatAction.TYPING)
 
+    patient_ctx = get_patient_context(uid)
+    system = SYSTEM_PROMPT + f"\n\nДАННЫЕ ПАЦИЕНТА: {patient_ctx}"
+
     # Собираем историю для Claude
     history = load_history(uid)
     messages = []
 
-    # Добавляем данные пациента как первое сообщение
-    patient_ctx = get_patient_context(uid)
-    messages.append({
-        "role": "user",
-        "content": f"Данные пациента: {patient_ctx}"
-    })
-    messages.append({
-        "role": "assistant",
-        "content": "Понял, учту эти данные в наших разговорах."
-    })
-
-    # История диалога
+    # История диалога (Claude требует строгое чередование user/assistant)
     for msg in history:
         messages.append({
             "role": msg["role"],
@@ -316,7 +308,7 @@ async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages.append({"role": "user", "content": user_text})
 
     try:
-        answer = await ask_claude(messages)
+        answer = await ask_claude(messages, system=system)
         append_history(uid, "user", user_text)
         append_history(uid, "assistant", answer[:1000])
         for i in range(0, len(answer), 4000):
