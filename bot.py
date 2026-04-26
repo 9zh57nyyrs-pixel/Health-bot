@@ -313,6 +313,10 @@ async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         append_history(uid, "assistant", answer[:1000])
         for i in range(0, len(answer), 4000):
             await update.message.reply_text(answer[i:i+4000])
+    except httpx.HTTPStatusError as e:
+        body = e.response.text
+        logger.error(f"Claude API HTTP error {e.response.status_code}: {body}")
+        await update.message.reply_text(f"⚠️ Ошибка API {e.response.status_code}: {body[:300]}")
     except Exception as e:
         logger.error(f"Ошибка Claude API {uid}: {e}")
         await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
