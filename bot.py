@@ -1,9 +1,10 @@
 import os
 import sys
 import logging
+import base64
+import httpx
 import psycopg2
 import psycopg2.extras
-import google.generativeai as genai
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -16,31 +17,49 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout,
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 GENDER, AGE, DISEASES, MEDS = range(4)
 MAX_HISTORY = 10
-ai_model = None
+
+SYSTEM_PROMPT = (
+    "Ты — персональный медицинский ассистент. "
+    "Отвечаешь на русском языке. "
+    "Пиши коротко, чётко и по делу — без лишних вступлений и повторений. "
+    "Учитывай данные пациента из контекста. "
+    "Если вопрос не про здоровье — вежливо скажи об этом. "
+    "В конце ответа кратко напоминай что ты не заменяешь врача."
+)
 
 
-def setup_ai():
-    try:
-        genai.configure(api_key=GEMINI_KEY)
-        models = [m.name for m in genai.list_models()
-                  if "generateContent" in m.supported_generation_methods]
-        priority = ["models/gemini-1.5-flash", "models/gemini-1.5-flash-latest", "models/gemini-pro"]
-        for p in priority:
-            if p in models:
-                logger.info(f"Выбрана модель: {p}")
-                return genai.GenerativeModel(p)
-        if models:
-            return genai.GenerativeModel(models[0])
-        return None
-    except Exception as e:
-        logger.error(f"Ошибка инициализации ИИ: {e}")
-        return None
+# ══════════════════════════════════════════════════════════════════════════════
+# Claude API
+# ══════════════════════════════════════════════════════════════════════════════
 
+async def ask_claude(messages: list, system: str = SYSTEM_PROMPT) -> str:
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "system": system,
+        "messages": messages,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, headers=headers, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["content"][0]["text"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# База данных
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_conn():
     if not DATABASE_URL:
@@ -65,7 +84,7 @@ def init_db():
     logger.info("БД инициализирована")
 
 
-def get_patient_context(uid):
+def get_patient_context(uid: int) -> str:
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -76,10 +95,10 @@ def get_patient_context(uid):
                     f"заболевания: {row['diseases']}, лекарства: {row['meds']}.")
     except Exception as e:
         logger.error(f"Ошибка чтения пациента {uid}: {e}")
-    return "Анкета не заполнена. Попроси пользователя заполнить /anketa."
+    return "Анкета не заполнена."
 
 
-def save_patient(uid, gender, age, diseases, meds):
+def save_patient(uid: int, gender: str, age: int, diseases: str, meds: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -90,7 +109,7 @@ def save_patient(uid, gender, age, diseases, meds):
             """, (uid, gender, age, diseases, meds, gender, age, diseases, meds))
 
 
-def load_history(uid):
+def load_history(uid: int) -> list:
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -105,7 +124,7 @@ def load_history(uid):
         return []
 
 
-def append_history(uid, role, message):
+def append_history(uid: int, role: str, message: str):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -116,7 +135,7 @@ def append_history(uid, role, message):
         logger.error(f"Ошибка записи истории {uid}: {e}")
 
 
-def clear_history(uid):
+def clear_history(uid: int):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -125,11 +144,15 @@ def clear_history(uid):
         logger.error(f"Ошибка очистки истории {uid}: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Команды
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "друг"
     await update.message.reply_text(
         f"👋 Привет, {name}!\n\n"
-        "Я — твой персональный медицинский ассистент на базе ИИ.\n\n"
+        "Я — твой персональный медицинский ассистент.\n\n"
         "Что я умею:\n"
         "• Отвечать на медицинские вопросы\n"
         "• Анализировать фото результатов анализов\n"
@@ -164,6 +187,10 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_history(update.effective_user.id)
     await update.message.reply_text("🗑 История очищена. Начинаем заново!")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Анкета
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def anketa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["Мужской", "Женский"]]
@@ -233,75 +260,85 @@ async def anketa_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-SYSTEM_PROMPT = (
-    "Ты — персональный медицинский ассистент. Общаешься на русском языке. "
-    "Отвечай чётко и по существу. "
-    "Если вопрос не про медицину — вежливо скажи об этом. "
-    "Всегда напоминай что твои ответы не заменяют визита к врачу."
-)
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Основной обработчик сообщений
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not ai_model:
-        await update.message.reply_text("⚠️ ИИ недоступен. Попробуй позже.")
-        return
-
     uid = update.effective_user.id
     user_text = update.message.text or update.message.caption or "Проанализируй изображение"
     await update.message.reply_chat_action(ChatAction.TYPING)
 
+    # Собираем историю для Claude
     history = load_history(uid)
-    history_text = ""
-    if history:
-        history_text = "\n\nИСТОРИЯ ДИАЛОГА:\n"
-        for msg in history:
-            label = "Пользователь" if msg["role"] == "user" else "Ассистент"
-            history_text += f"{label}: {msg['message']}\n"
+    messages = []
 
-    content = [
-        SYSTEM_PROMPT + "\n",
-        f"ДАННЫЕ ПАЦИЕНТА: {get_patient_context(uid)}\n",
-        history_text,
-        f"\nЗАПРОС: {user_text}",
-    ]
+    # Добавляем данные пациента как первое сообщение
+    patient_ctx = get_patient_context(uid)
+    messages.append({
+        "role": "user",
+        "content": f"Данные пациента: {patient_ctx}"
+    })
+    messages.append({
+        "role": "assistant",
+        "content": "Понял, учту эти данные в наших разговорах."
+    })
 
+    # История диалога
+    for msg in history:
+        messages.append({
+            "role": msg["role"],
+            "content": msg["message"]
+        })
+
+    # Текущий запрос
     if update.message.photo:
         try:
             file = await update.message.photo[-1].get_file()
             img_bytes = await file.download_as_bytearray()
-            content.append({"mime_type": "image/jpeg", "data": bytes(img_bytes)})
+            img_b64 = base64.standard_b64encode(bytes(img_bytes)).decode()
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img_b64
+                    }},
+                    {"type": "text", "text": user_text}
+                ]
+            })
         except Exception as e:
             logger.error(f"Ошибка фото {uid}: {e}")
             await update.message.reply_text("⚠️ Не удалось загрузить фото.")
             return
+    else:
+        messages.append({"role": "user", "content": user_text})
 
     try:
-        response = ai_model.generate_content(content)
-        answer = response.text
+        answer = await ask_claude(messages)
         append_history(uid, "user", user_text)
         append_history(uid, "assistant", answer[:1000])
         for i in range(0, len(answer), 4000):
             await update.message.reply_text(answer[i:i+4000])
     except Exception as e:
-        logger.error(f"Ошибка генерации {uid}: {e}")
+        logger.error(f"Ошибка Claude API {uid}: {e}")
         await update.message.reply_text(f"⚠️ Ошибка: {str(e)}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Запуск
+# ══════════════════════════════════════════════════════════════════════════════
+
 def main():
-    global ai_model
     if not TOKEN:
         logger.critical("TELEGRAM_TOKEN не задан!")
         sys.exit(1)
-    if not GEMINI_KEY:
-        logger.critical("GEMINI_API_KEY не задан!")
+    if not ANTHROPIC_API_KEY:
+        logger.critical("ANTHROPIC_API_KEY не задан!")
         sys.exit(1)
     if not DATABASE_URL:
         logger.critical("DATABASE_URL не задан!")
-        sys.exit(1)
-
-    ai_model = setup_ai()
-    if not ai_model:
-        logger.critical("Не удалось инициализировать Gemini!")
         sys.exit(1)
 
     init_db()
