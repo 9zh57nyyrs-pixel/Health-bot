@@ -3,6 +3,10 @@ import json
 from bot.config import Config
 
 async def analyze_symptoms(symptoms_data: dict) -> dict:
+    """
+    Анализирует симптомы через Gemini API (Google)
+    """
+    
     prompt = f"""Ты - медицинский ассистент. Ты НЕ врач и НЕ ставишь диагнозы.
     Твоя задача - проанализировать жалобы пациента и дать ОБЩУЮ информацию.
     
@@ -39,51 +43,72 @@ async def analyze_symptoms(symptoms_data: dict) -> dict:
     try:
         async with aiohttp.ClientSession() as session:
             headers = {
-                "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://t.me/medical_assistant_bot",
-                "X-Title": "Medical Assistant Bot"
+                "Content-Type": "application/json"
             }
             
             payload = {
-                "model": "anthropic/claude-3.5-haiku",
-                "messages": [
-                    {"role": "system", "content": "Ты медицинский ассистент. Ты не врач. Не ставь диагнозы. Не назначай лечение."},
-                    {"role": "user", "content": prompt}
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": prompt
+                            }
+                        ]
+                    }
                 ],
-                "temperature": 0.3,
-                "max_tokens": 1000
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "maxOutputTokens": 1000
+                }
             }
             
+            # Используем Gemini API
+            api_key = Config.GEMINI_API_KEY
+            
+            if not api_key:
+                return {
+                    "urgency": "medium",
+                    "possible_areas": ["требуется осмотр"],
+                    "recommended_specialist": "Терапевт",
+                    "analysis": "API ключ не настроен. Рекомендуется консультация врача.",
+                    "recommendations": ["Обратитесь к врачу"],
+                    "warnings": [],
+                    "disclaimer": "Это не медицинская консультация."
+                }
+            
             async with session.post(
-                "https://openrouter.ai/api/v1/chat/completions",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
                 headers=headers,
                 json=payload
             ) as response:
                 if response.status == 200:
                     data = await response.json()
-                    content = data["choices"][0]["message"]["content"]
                     
+                    # Извлекаем текст из ответа Gemini
                     try:
+                        content = data["candidates"][0]["content"]["parts"][0]["text"]
+                        
+                        # Пытаемся распарсить JSON
                         content = content.replace("```json", "").replace("```", "").strip()
                         result = json.loads(content)
                         return result
-                    except json.JSONDecodeError:
+                    except (KeyError, json.JSONDecodeError):
                         return {
                             "urgency": "medium",
                             "possible_areas": ["требуется осмотр"],
                             "recommended_specialist": "Терапевт",
-                            "analysis": content,
+                            "analysis": content if 'content' in dir() else "Анализ требует уточнения. Обратитесь к врачу.",
                             "recommendations": ["Обратитесь к врачу для осмотра"],
                             "warnings": [],
                             "disclaimer": "Это не медицинская консультация. Обратитесь к врачу."
                         }
                 else:
+                    error_text = await response.text()
                     return {
                         "urgency": "medium",
                         "possible_areas": ["требуется осмотр"],
                         "recommended_specialist": "Терапевт",
-                        "analysis": "Не удалось провести автоматический анализ. Рекомендуется консультация врача.",
+                        "analysis": f"Ошибка API: {error_text}. Рекомендуется консультация врача.",
                         "recommendations": ["Запишитесь к терапевту"],
                         "warnings": [],
                         "disclaimer": "Это не медицинская консультация."
